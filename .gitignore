@@ -2,3 +2,4 @@
 cas.json
 *.log
 smart_contracts.db
+node_modules/
