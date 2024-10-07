@@ -1,5 +1,15 @@
-*.csv
-cas.json
+# Logs
 *.log
-smart_contracts.db
+
+# Node modules
 node_modules/
+
+# SQLite database files
+*.db
+
+# Environment files
+.env
+
+# Other system files
+.DS_Store
+Thumbs.db

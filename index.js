@@ -4,6 +4,7 @@ const fs = require('fs');
 const { promisify } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
+const restAddress = "http://tasty.seipex.fi:1317"
 const NUM_WORKERS = 3;
 const API_KEY = 'a48f0d74';
 const BATCH_SIZE = 100;
@@ -88,7 +89,7 @@ async function createTables() {
 // Create an axios instance with the API key
 function createApiInstance() {
   return axios.create({
-    baseURL: 'http://rpc.seipex.fi:1317',
+    baseURL: restAddress,
     headers: {
       'x-api-key': API_KEY
     }
