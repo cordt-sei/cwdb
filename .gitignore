@@ -1,10 +1,12 @@
 # Logs
 *.log
+logs/
 
 # Node modules
 node_modules/
 
 # SQLite database files
+data/
 *.db
 
 # Environment files

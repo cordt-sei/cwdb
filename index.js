@@ -1,24 +1,25 @@
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
+const path = require('path');
 const { promisify } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
-
-const restAddress = "http://tasty.seipex.fi:1317"
-const NUM_WORKERS = 3;
-const API_KEY = 'a48f0d74';
-const BATCH_SIZE = 100;
-const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
+const {
+  RPC_WEBSOCKET_URL,
+  restAddress,
+  API_KEY,
+  NUM_WORKERS,
+  DB_PATH,
+  LOG_FILE,
+  BATCH_SIZE,
+  MAX_RETRIES,
+  RETRY_DELAY
+} = require('./config');
 
 let logStream;
 let db;
 
-// Set up logging
-function setupLogging() {
-  logStream = fs.createWriteStream('data_collection.log', { flags: 'a' });
-}
-
+// Define log function first
 function log(message) {
   const timestamp = new Date().toISOString();
   const logMessage = `${timestamp} - ${message}\n`;
@@ -28,10 +29,23 @@ function log(message) {
   }
 }
 
+// Set up logging
+function setupLogging() {
+  const logDir = path.dirname(LOG_FILE);
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+}
+
 // Set up database
 async function setupDatabase() {
   return new Promise((resolve, reject) => {
-    db = new sqlite3.Database('./smart_contracts.db', (err) => {
+    const dbDir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
+    db = new sqlite3.Database(DB_PATH, (err) => {
       if (err) {
         log(`Error opening database: ${err.message}`);
         reject(err);

@@ -19,19 +19,21 @@ This project is a comprehensive indexer for CosmWasm smart contracts on the Sei 
 ## Installation
 
 1. **Clone the Repository**
+
    ```bash
    git clone <repository-url>
    cd <repository-directory>
    ```
 
 2. **Install Dependencies**
+
    ```bash
    yarn install
    ```
 
 ## Project Structure
 
-```
+```shell
 cwdb/
 ├── data/
 │   └── smart_contracts.db
