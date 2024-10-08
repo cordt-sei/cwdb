@@ -2,7 +2,8 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { promisify } = require('util');
 const fs = require('fs');
-const { handleContract, determineContractType } = require('./cw721Helper');
+const { handleContract, determineContractType, fetchAllTokensForContracts, fetchTokenOwners } = require('./cw721Helper');
+
 
 const RPC_WEBSOCKET_URL = 'wss://rpc.sei-apis.com/websocket';
 const restAddress = 'http://tasty.seipex.fi:1317'; // REST endpoint for queries
@@ -122,7 +123,7 @@ async function determineContractTypes() {
   log('Finished determining contract types.');
 }
 
-// Step 2: Iterate over all CW721 contracts to query token IDs
+// Step 2: Iterate over all CW721 contracts to query token IDs and owners
 async function processCW721Contracts() {
   const sql = "SELECT address FROM contracts WHERE type = 'CW721'";
   const cw721Contracts = await promisify(db.all).bind(db)(sql);
@@ -132,15 +133,9 @@ async function processCW721Contracts() {
     log(`Querying tokens for CW721 contract ${contractAddress}...`);
 
     try {
-      const owners = await handleContract(restAddress, contractAddress, db);
-
-      if (owners && owners.length > 0) {
-        for (const { token_id, owner } of owners) {
-          const insertSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner)
-            VALUES (?, ?, ?)`;
-          await promisify(db.run).bind(db)(insertSQL, [contractAddress, token_id, owner]);
-          log(`Recorded ownership: Token ${token_id} owned by ${owner}`);
-        }
+      const tokens = await handleContract(restAddress, contractAddress, db);
+      if (tokens.length === 0) {
+        log(`No tokens found for contract ${contractAddress}.`);
       }
     } catch (error) {
       log(`Error processing CW721 contract ${contractAddress}: ${error.message}`);
@@ -205,9 +200,11 @@ async function main() {
     await setupDatabase();
     await createTables();
 
-    await determineContractTypes();
+    // First, fetch and store token IDs for each CW721 contract
+    await fetchAllTokensForContracts(restAddress, db);
 
-    await processCW721Contracts();
+    // After all token IDs are recorded, fetch and store the owner information for each token
+    await fetchTokenOwners(restAddress, db);
 
     setupWebSocket();
   } catch (error) {
