@@ -2,22 +2,18 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { promisify } = require('util');
 const fs = require('fs');
+const path = require('path');
 const { handleContract, determineContractType, fetchAllTokensForContracts, fetchTokenOwners } = require('./cw721Helper');
-
 
 const RPC_WEBSOCKET_URL = 'wss://rpc.sei-apis.com/websocket';
 const restAddress = 'http://tasty.seipex.fi:1317'; // REST endpoint for queries
-const DB_PATH = './smart_contracts.db';
-const LOG_FILE = 'real_time_indexer.log';
+const DB_PATH = path.join(__dirname, 'data', 'smart_contracts.db');
+const LOG_FILE = path.join(__dirname, 'logs', 'real_time_indexer.log');
 
 let db;
 let logStream;
 
-// Set up logging
-function setupLogging() {
-  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-}
-
+// Define the log function at the top level
 function log(message) {
   const timestamp = new Date().toISOString();
   const logMessage = `${timestamp} - ${message}\n`;
@@ -27,9 +23,22 @@ function log(message) {
   }
 }
 
+// Set up logging
+function setupLogging() {
+  const logDir = path.dirname(LOG_FILE);
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+}
+
 // Set up database connection
 async function setupDatabase() {
   return new Promise((resolve, reject) => {
+    const dbDir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
     db = new sqlite3.Database(DB_PATH, (err) => {
       if (err) {
         log(`Error opening database: ${err.message}`);
