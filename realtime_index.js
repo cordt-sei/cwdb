@@ -2,10 +2,10 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { promisify } = require('util');
 const fs = require('fs');
-const { isCW721Contract, queryNFTOwners } = require('./cw721Helper'); // Import the helper module
+const { handleContract, determineContractType } = require('./cw721Helper');
 
 const RPC_WEBSOCKET_URL = 'wss://rpc.sei-apis.com/websocket';
-const RPC_REST_URL = 'http://tasty.seipex.fi:1317'; // Add your RPC REST URL for querying contract info
+const restAddress = 'http://tasty.seipex.fi:1317'; // REST endpoint for queries
 const DB_PATH = './smart_contracts.db';
 const LOG_FILE = 'real_time_indexer.log';
 
@@ -41,22 +41,110 @@ async function setupDatabase() {
   });
 }
 
-// Process instantiate contract event
-async function processInstantiateEvent(event) {
-  const contract = {
-    address: event._contract_address,
-    code_id: parseInt(event.code_id)
-  };
-  
-  log(`Processing new contract: ${contract.address}`);
-  
-  // Check if the contract is CW721
-  const isCW721 = await isCW721Contract(RPC_REST_URL, contract.address);
-  if (isCW721) {
-    log(`Contract ${contract.address} is a CW721 contract. Querying NFT owners...`);
-    await queryNFTOwners(RPC_REST_URL, contract.address, db);
-  } else {
-    log(`Contract ${contract.address} is not a CW721 contract.`);
+// Create necessary tables for contracts, tokens, and owners
+async function createTables() {
+  const tables = [
+    `CREATE TABLE IF NOT EXISTS contracts (
+      address TEXT PRIMARY KEY,
+      admin TEXT,
+      creator TEXT,
+      type TEXT DEFAULT 'UNKNOWN'
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_info (
+      address TEXT PRIMARY KEY,
+      type TEXT DEFAULT 'UNKNOWN'
+    )`,
+    `CREATE TABLE IF NOT EXISTS nft_owners (
+      collection_address TEXT,
+      token_id TEXT,
+      owner TEXT,
+      PRIMARY KEY (collection_address, token_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_tokens (
+      contract_address TEXT PRIMARY KEY,
+      admin TEXT,
+      creator TEXT,
+      contract_type TEXT,
+      extra_data TEXT
+    )`
+  ];
+
+  for (const table of tables) {
+    try {
+      await promisify(db.run).bind(db)(table);
+    } catch (error) {
+      log(`Error creating/updating table: ${error.message}`);
+    }
+  }
+
+  log('Tables created/updated successfully.');
+}
+
+// Fetch all contracts without a known type
+async function fetchContractsWithoutType() {
+  const sql = "SELECT address FROM contracts WHERE type = 'UNKNOWN'";
+  const contracts = await promisify(db.all).bind(db)(sql);
+  return contracts.map(contract => contract.address);
+}
+
+// Update contract type in the database
+async function updateContractType(contractAddress, contractType) {
+  const sql = "UPDATE contracts SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sql, [contractType, contractAddress]);
+
+  const sqlInfo = "UPDATE contract_info SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sqlInfo, [contractType, contractAddress]);
+
+  log(`Updated contract ${contractAddress} with type ${contractType}`);
+}
+
+// Step 1: Retroactively determine contract types using the test query
+async function determineContractTypes() {
+  log('Determining contract types...');
+  const contracts = await fetchContractsWithoutType();
+
+  for (const contractAddress of contracts) {
+    log(`Checking contract type for ${contractAddress}...`);
+    try {
+      const contractType = await determineContractType(restAddress, contractAddress);
+
+      if (contractType) {
+        await updateContractType(contractAddress, contractType);
+        log(`Contract ${contractAddress} is labeled as ${contractType}`);
+      } else {
+        log(`Could not determine contract type for ${contractAddress}.`);
+      }
+    } catch (error) {
+      log(`Error determining contract type for ${contractAddress}: ${error.message}`);
+    }
+  }
+
+  log('Finished determining contract types.');
+}
+
+// Step 2: Iterate over all CW721 contracts to query token IDs
+async function processCW721Contracts() {
+  const sql = "SELECT address FROM contracts WHERE type = 'CW721'";
+  const cw721Contracts = await promisify(db.all).bind(db)(sql);
+
+  for (const contract of cw721Contracts) {
+    const contractAddress = contract.address;
+    log(`Querying tokens for CW721 contract ${contractAddress}...`);
+
+    try {
+      const owners = await handleContract(restAddress, contractAddress, db);
+
+      if (owners && owners.length > 0) {
+        for (const { token_id, owner } of owners) {
+          const insertSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner)
+            VALUES (?, ?, ?)`;
+          await promisify(db.run).bind(db)(insertSQL, [contractAddress, token_id, owner]);
+          log(`Recorded ownership: Token ${token_id} owned by ${owner}`);
+        }
+      }
+    } catch (error) {
+      log(`Error processing CW721 contract ${contractAddress}: ${error.message}`);
+    }
   }
 }
 
@@ -92,11 +180,12 @@ function setupWebSocket() {
             admin: events['instantiate.admin'] ? events['instantiate.admin'][0] : '',
             label: events['instantiate.label'] ? events['instantiate.label'][0] : ''
           };
-          await processInstantiateEvent(instantiateEvent);
+          log(`Detected new contract: ${instantiateEvent._contract_address}`);
+          await determineContractTypes(); // Run the contract type detection for the new contract
         }
       }
     } catch (error) {
-      log(`Error processing message: ${error.message}`);
+      log(`Error processing WebSocket message: ${error.message}`);
     }
   });
 
@@ -110,11 +199,16 @@ function setupWebSocket() {
   });
 }
 
-// Main function
 async function main() {
   try {
     setupLogging();
     await setupDatabase();
+    await createTables();
+
+    await determineContractTypes();
+
+    await processCW721Contracts();
+
     setupWebSocket();
   } catch (error) {
     log(`Error in main: ${error.message}`);
@@ -122,5 +216,4 @@ async function main() {
   }
 }
 
-// Run the main function
 main();
