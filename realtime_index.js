@@ -2,19 +2,18 @@ const WebSocket = require('ws');
 const sqlite3 = require('sqlite3').verbose();
 const { promisify } = require('util');
 const fs = require('fs');
+const path = require('path');
+const { handleContract, determineContractType, fetchAllTokensForContracts, fetchTokenOwners } = require('./cw721Helper');
 
 const RPC_WEBSOCKET_URL = 'wss://rpc.sei-apis.com/websocket';
-const DB_PATH = './smart_contracts.db';
-const LOG_FILE = 'real_time_indexer.log';
+const restAddress = 'http://tasty.seipex.fi:1317'; // REST endpoint for queries
+const DB_PATH = path.join(__dirname, 'data', 'smart_contracts.db');
+const LOG_FILE = path.join(__dirname, 'logs', 'real_time_indexer.log');
 
 let db;
 let logStream;
 
-// Set up logging
-function setupLogging() {
-  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-}
-
+// Define the log function at the top level
 function log(message) {
   const timestamp = new Date().toISOString();
   const logMessage = `${timestamp} - ${message}\n`;
@@ -24,9 +23,22 @@ function log(message) {
   }
 }
 
+// Set up logging
+function setupLogging() {
+  const logDir = path.dirname(LOG_FILE);
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+}
+
 // Set up database connection
 async function setupDatabase() {
   return new Promise((resolve, reject) => {
+    const dbDir = path.dirname(DB_PATH);
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
     db = new sqlite3.Database(DB_PATH, (err) => {
       if (err) {
         log(`Error opening database: ${err.message}`);
@@ -39,107 +51,105 @@ async function setupDatabase() {
   });
 }
 
-// Create tables if they don't exist
+// Create necessary tables for contracts, tokens, and owners
 async function createTables() {
   const tables = [
-    `CREATE TABLE IF NOT EXISTS code_infos (
-      code_id INTEGER PRIMARY KEY,
-      creator TEXT,
-      data_hash TEXT,
-      instantiate_permission TEXT
-    )`,
     `CREATE TABLE IF NOT EXISTS contracts (
       address TEXT PRIMARY KEY,
-      code_id INTEGER,
-      FOREIGN KEY (code_id) REFERENCES code_infos (code_id)
+      admin TEXT,
+      creator TEXT,
+      type TEXT DEFAULT 'UNKNOWN'
     )`,
     `CREATE TABLE IF NOT EXISTS contract_info (
       address TEXT PRIMARY KEY,
-      code_id INTEGER,
-      creator TEXT,
+      type TEXT DEFAULT 'UNKNOWN'
+    )`,
+    `CREATE TABLE IF NOT EXISTS nft_owners (
+      collection_address TEXT,
+      token_id TEXT,
+      owner TEXT,
+      PRIMARY KEY (collection_address, token_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_tokens (
+      contract_address TEXT PRIMARY KEY,
       admin TEXT,
-      label TEXT,
-      ibc_port_id TEXT,
-      FOREIGN KEY (address) REFERENCES contracts (address)
+      creator TEXT,
+      contract_type TEXT,
+      extra_data TEXT
     )`
   ];
 
   for (const table of tables) {
-    await promisify(db.run).bind(db)(table);
+    try {
+      await promisify(db.run).bind(db)(table);
+    } catch (error) {
+      log(`Error creating/updating table: ${error.message}`);
+    }
   }
-  log('Tables created successfully.');
+
+  log('Tables created/updated successfully.');
 }
 
-// Insert or update code info
-async function upsertCodeInfo(codeInfo) {
-  const sql = `
-    INSERT OR REPLACE INTO code_infos (code_id, creator, data_hash, instantiate_permission)
-    VALUES (?, ?, ?, ?)
-  `;
-  await promisify(db.run).bind(db)(sql, [
-    codeInfo.code_id,
-    codeInfo.creator,
-    codeInfo.data_hash,
-    JSON.stringify(codeInfo.instantiate_permission)
-  ]);
-  log(`Upserted code info for code_id: ${codeInfo.code_id}`);
+// Fetch all contracts without a known type
+async function fetchContractsWithoutType() {
+  const sql = "SELECT address FROM contracts WHERE type = 'UNKNOWN'";
+  const contracts = await promisify(db.all).bind(db)(sql);
+  return contracts.map(contract => contract.address);
 }
 
-// Insert or update contract
-async function upsertContract(contract) {
-  const sql = `
-    INSERT OR REPLACE INTO contracts (address, code_id)
-    VALUES (?, ?)
-  `;
-  await promisify(db.run).bind(db)(sql, [contract.address, contract.code_id]);
-  log(`Upserted contract: ${contract.address}`);
+// Update contract type in the database
+async function updateContractType(contractAddress, contractType) {
+  const sql = "UPDATE contracts SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sql, [contractType, contractAddress]);
+
+  const sqlInfo = "UPDATE contract_info SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sqlInfo, [contractType, contractAddress]);
+
+  log(`Updated contract ${contractAddress} with type ${contractType}`);
 }
 
-// Insert or update contract info
-async function upsertContractInfo(contractInfo) {
-  const sql = `
-    INSERT OR REPLACE INTO contract_info (address, code_id, creator, admin, label, ibc_port_id)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `;
-  await promisify(db.run).bind(db)(sql, [
-    contractInfo.address,
-    contractInfo.code_id,
-    contractInfo.creator,
-    contractInfo.admin,
-    contractInfo.label,
-    contractInfo.ibc_port_id
-  ]);
-  log(`Upserted contract info for address: ${contractInfo.address}`);
+// Step 1: Retroactively determine contract types using the test query
+async function determineContractTypes() {
+  log('Determining contract types...');
+  const contracts = await fetchContractsWithoutType();
+
+  for (const contractAddress of contracts) {
+    log(`Checking contract type for ${contractAddress}...`);
+    try {
+      const contractType = await determineContractType(restAddress, contractAddress);
+
+      if (contractType) {
+        await updateContractType(contractAddress, contractType);
+        log(`Contract ${contractAddress} is labeled as ${contractType}`);
+      } else {
+        log(`Could not determine contract type for ${contractAddress}.`);
+      }
+    } catch (error) {
+      log(`Error determining contract type for ${contractAddress}: ${error.message}`);
+    }
+  }
+
+  log('Finished determining contract types.');
 }
 
-// Process store code event
-async function processStoreCodeEvent(event) {
-  const codeInfo = {
-    code_id: parseInt(event.code_id),
-    creator: event.sender,
-    data_hash: event.code_hash,
-    instantiate_permission: { permission: 'Everybody', address: '' } // Default permission, adjust as needed
-  };
-  await upsertCodeInfo(codeInfo);
-}
+// Step 2: Iterate over all CW721 contracts to query token IDs and owners
+async function processCW721Contracts() {
+  const sql = "SELECT address FROM contracts WHERE type = 'CW721'";
+  const cw721Contracts = await promisify(db.all).bind(db)(sql);
 
-// Process instantiate contract event
-async function processInstantiateEvent(event) {
-  const contract = {
-    address: event._contract_address,
-    code_id: parseInt(event.code_id)
-  };
-  await upsertContract(contract);
+  for (const contract of cw721Contracts) {
+    const contractAddress = contract.address;
+    log(`Querying tokens for CW721 contract ${contractAddress}...`);
 
-  const contractInfo = {
-    address: event._contract_address,
-    code_id: parseInt(event.code_id),
-    creator: event.sender,
-    admin: event.admin || '',
-    label: event.label || '',
-    ibc_port_id: '' // Add this if available in the event
-  };
-  await upsertContractInfo(contractInfo);
+    try {
+      const tokens = await handleContract(restAddress, contractAddress, db);
+      if (tokens.length === 0) {
+        log(`No tokens found for contract ${contractAddress}.`);
+      }
+    } catch (error) {
+      log(`Error processing CW721 contract ${contractAddress}: ${error.message}`);
+    }
+  }
 }
 
 // WebSocket connection and subscription
@@ -149,16 +159,6 @@ function setupWebSocket() {
   ws.on('open', () => {
     log('Connected to WebSocket');
     
-    // Subscribe to store code events
-    ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'subscribe',
-      id: 1,
-      params: {
-        query: "tm.event='Tx' AND store_code.code_id EXISTS"
-      }
-    }));
-
     // Subscribe to instantiate contract events
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
@@ -175,15 +175,6 @@ function setupWebSocket() {
       const message = JSON.parse(data);
       if (message.result && message.result.events) {
         const events = message.result.events;
-        
-        if (events['store_code.code_id']) {
-          const storeCodeEvent = {
-            code_id: events['store_code.code_id'][0],
-            sender: events['message.sender'][0],
-            code_hash: events['store_code.code_hash'][0]
-          };
-          await processStoreCodeEvent(storeCodeEvent);
-        }
 
         if (events['instantiate._contract_address']) {
           const instantiateEvent = {
@@ -193,11 +184,12 @@ function setupWebSocket() {
             admin: events['instantiate.admin'] ? events['instantiate.admin'][0] : '',
             label: events['instantiate.label'] ? events['instantiate.label'][0] : ''
           };
-          await processInstantiateEvent(instantiateEvent);
+          log(`Detected new contract: ${instantiateEvent._contract_address}`);
+          await determineContractTypes(); // Run the contract type detection for the new contract
         }
       }
     } catch (error) {
-      log(`Error processing message: ${error.message}`);
+      log(`Error processing WebSocket message: ${error.message}`);
     }
   });
 
@@ -211,12 +203,18 @@ function setupWebSocket() {
   });
 }
 
-// Main function
 async function main() {
   try {
     setupLogging();
     await setupDatabase();
     await createTables();
+
+    // First, fetch and store token IDs for each CW721 contract
+    await fetchAllTokensForContracts(restAddress, db);
+
+    // After all token IDs are recorded, fetch and store the owner information for each token
+    await fetchTokenOwners(restAddress, db);
+
     setupWebSocket();
   } catch (error) {
     log(`Error in main: ${error.message}`);
@@ -224,5 +222,4 @@ async function main() {
   }
 }
 
-// Run the main function
 main();
