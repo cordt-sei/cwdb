@@ -12,7 +12,9 @@ import {
   LOG_FILE, 
   BLOCK_HEIGHT,
   MAX_RETRIES,
-  RETRY_DELAY
+  RETRY_DELAY,
+  NUM_WORKERS,
+  maxWorkerRetries
 } from './config.js';
 
 import {
@@ -256,6 +258,53 @@ function setupWebSocket() {
   });
 }
 
+import { Worker } from 'worker_threads'; // Ensure worker_threads is imported
+
+// Function to process contracts using workers
+async function processContractsWithWorkers(codeInfos, currentBlockHeight) {
+  const chunkSize = Math.ceil(codeInfos.length / NUM_WORKERS); // Split codeInfos into chunks for each worker
+  const workers = [];
+  let workerRetryCounts = Array(NUM_WORKERS).fill(0); // Track retries for each worker
+
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    await startWorker(i, codeInfos.slice(i * chunkSize, (i + 1) * chunkSize), currentBlockHeight);
+  }
+
+  async function startWorker(workerId, workerDataChunk, startBlockHeight) {
+    if (workerRetryCounts[workerId] >= maxWorkerRetries) {
+      log(`Worker ${workerId} exceeded the maximum retry limit. Aborting.`);
+      return;
+    }
+
+    log(`Starting Worker ${workerId}... Attempt: ${workerRetryCounts[workerId] + 1}`);
+
+    const worker = new Worker(__filename, {
+      workerData: { workerId, codeInfos: workerDataChunk, startBlockHeight }
+    });
+
+    worker.on('error', async (err) => {
+      log(`Worker ${workerId} encountered an error: ${err.message}`);
+      worker.terminate();
+      workerRetryCounts[workerId]++;
+      await startWorker(workerId, workerDataChunk, startBlockHeight); // Retry the worker if error occurs
+    });
+
+    worker.on('message', () => {
+      log(`Worker ${workerId} completed successfully.`);
+      workerRetryCounts[workerId] = 0; // Reset retry count on success
+    });
+
+    workers.push(worker);
+  }
+
+  // Wait for all workers to complete
+  await Promise.all(workers.map(worker => new Promise((resolve) => {
+    worker.on('message', resolve);
+  })));
+
+  log('All workers have completed their tasks.');
+}
+
 async function main() {
   try {
     setupLogging();
@@ -266,24 +315,15 @@ async function main() {
 
     const { last_processed_code_id, last_processed_block_height } = await getLastProcessedState();
     log(`Resuming from Code ID: ${last_processed_code_id}, Block Height: ${last_processed_block_height}`);
-    
-    // Check and fix missing data
+
     await checkAndFixMissingContractTypes(db, restAddress);
     await checkAndFixMissingTokens(db, restAddress);
     await checkAndFixMissingOwners(db, restAddress);
 
-    // Fetch all tokens for contracts (CW721 and CW1155)
-    await fetchAllTokensForContracts(restAddress, db);
-
-    // Fetch and store token owners for the fetched tokens
-    await fetchTokenOwners(restAddress, db);
-
-    // Get the latest block height
     const latestBlockResponse = await retryOperation(() => fetch(`${restAddress}/cosmos/base/tendermint/v1beta1/blocks/latest`));
     const latestBlockData = await latestBlockResponse.json();
     const currentBlockHeight = parseInt(latestBlockData.block.header.height);
 
-    // Fetch contract code info
     const codeInfos = [];
     let nextKey = null;
     do {
@@ -304,14 +344,11 @@ async function main() {
 
     log(`Fetched a total of ${codeInfos.length} new code infos. Starting processing with workers.`);
 
-    // Process contracts using workers
     await processContractsWithWorkers(codeInfos, currentBlockHeight);
 
-    // Update pointer and EVM addresses after contract processing
     await updatePointerAddresses(db);
     await updateEVMAddresses(db);
 
-    // Update the last processed state if new code infos were fetched
     if (codeInfos.length > 0) {
       const lastCodeId = codeInfos[codeInfos.length - 1].code_id;
       await updateLastProcessedState(lastCodeId, currentBlockHeight);
@@ -319,7 +356,6 @@ async function main() {
 
     log('Data collection completed successfully.');
 
-    // Set up WebSocket if no specific block height is provided
     if (BLOCK_HEIGHT === null) {
       setupWebSocket();
     } else {
