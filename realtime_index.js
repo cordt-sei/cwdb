@@ -1,44 +1,38 @@
-const WebSocket = require('ws');
-const sqlite3 = require('sqlite3').verbose();
-const { promisify } = require('util');
-const fs = require('fs');
-const path = require('path');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
-const axios = require('axios');
-const { 
+import fetch from 'node-fetch';
+import WebSocket from 'ws';
+import sqlite3 from 'sqlite3';
+import { promisify } from 'util';
+import fs from 'fs';
+import path, { dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { 
   RPC_WEBSOCKET_URL, 
   restAddress, 
-  API_KEY, 
   DB_PATH, 
   LOG_FILE, 
-  BATCH_SIZE, 
-  MAX_RETRIES, 
-  RETRY_DELAY,
-  NUM_WORKERS,
-  BLOCK_HEIGHT
-} = require('./config');
-const {
+  BLOCK_HEIGHT,
+  MAX_RETRIES,
+  RETRY_DELAY
+} from './config.js';
+
+import {
   handleContract,
   determineContractType,
   fetchAllTokensForContracts,
   fetchTokenOwners,
-  batchInsert,
+  checkAndFixMissingContractTypes,
+  checkAndFixMissingTokens,
+  checkAndFixMissingOwners,
   updatePointerAddresses,
   updateEVMAddresses
-} = require('./cw721Helper');
+} from './cw721Helper.js';
+
+const __filename = fileURLToPath(import.meta.url);
 
 let db;
 let logStream;
 
-// Logging setup
-function setupLogging() {
-  const logDir = path.dirname(LOG_FILE);
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
-  }
-  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-}
-
+// Define the log function at the top level
 function log(message) {
   const timestamp = new Date().toISOString();
   const logMessage = `${timestamp} - ${message}\n`;
@@ -48,16 +42,16 @@ function log(message) {
   }
 }
 
-function logDetailedProgress(workerId, message) {
-  const timestamp = new Date().toISOString();
-  const logMessage = `${timestamp} - Worker ${workerId}: ${message}`;
-  console.log(logMessage);
-  if (logStream && !logStream.destroyed) {
-    logStream.write(logMessage + '\n');
+// Set up logging
+function setupLogging() {
+  const logDir = path.dirname(LOG_FILE);
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
   }
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
 }
 
-// Database setup
+// Set up database connection
 async function setupDatabase() {
   return new Promise((resolve, reject) => {
     const dbDir = path.dirname(DB_PATH);
@@ -76,49 +70,28 @@ async function setupDatabase() {
   });
 }
 
-// Create necessary tables
+// Create necessary tables for contracts, tokens, and owners
 async function createTables() {
   const tables = [
-    `CREATE TABLE IF NOT EXISTS code_infos (
-      code_id INTEGER PRIMARY KEY,
-      creator TEXT,
-      data_hash TEXT,
-      instantiate_permission TEXT
+    `CREATE TABLE IF NOT EXISTS indexer_progress (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_processed_code_id INTEGER,
+      last_processed_block_height INTEGER
     )`,
     `CREATE TABLE IF NOT EXISTS contracts (
       address TEXT PRIMARY KEY,
-      code_id INTEGER,
       admin TEXT,
       creator TEXT,
-      type TEXT DEFAULT 'UNKNOWN',
-      pointer_address TEXT,
-      pointee_address TEXT,
-      FOREIGN KEY (code_id) REFERENCES code_infos (code_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS contract_history (
-      address TEXT,
-      operation TEXT,
-      code_id INTEGER,
-      msg TEXT,
-      FOREIGN KEY (address) REFERENCES contracts (address)
+      type TEXT DEFAULT 'UNKNOWN'
     )`,
     `CREATE TABLE IF NOT EXISTS contract_info (
       address TEXT PRIMARY KEY,
-      code_id INTEGER,
-      creator TEXT,
-      admin TEXT,
-      label TEXT,
-      ibc_port_id TEXT,
-      type TEXT DEFAULT 'UNKNOWN',
-      FOREIGN KEY (address) REFERENCES contracts (address)
+      type TEXT DEFAULT 'UNKNOWN'
     )`,
     `CREATE TABLE IF NOT EXISTS nft_owners (
       collection_address TEXT,
       token_id TEXT,
       owner TEXT,
-      pointer_address TEXT,
-      pointee_address TEXT,
-      evm_address TEXT,
       PRIMARY KEY (collection_address, token_id)
     )`,
     `CREATE TABLE IF NOT EXISTS contract_tokens (
@@ -127,14 +100,10 @@ async function createTables() {
       creator TEXT,
       contract_type TEXT,
       extra_data TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS indexer_progress (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      last_processed_code_id INTEGER,
-      last_processed_block_height INTEGER
     )`
   ];
 
+  // Execute each SQL statement to create the necessary tables
   for (const table of tables) {
     try {
       await promisify(db.run).bind(db)(table);
@@ -146,143 +115,94 @@ async function createTables() {
   log('Tables created/updated successfully.');
 }
 
-// Function to get the last processed state
-async function getLastProcessedState() {
-  const result = await promisify(db.get).bind(db)('SELECT * FROM indexer_progress WHERE id = 1');
-  return result || { last_processed_code_id: 0, last_processed_block_height: 0 };
+// Fetch all contracts without a known type
+async function fetchContractsWithoutType() {
+  const sql = "SELECT address FROM contracts WHERE type = 'UNKNOWN'";
+  const contracts = await promisify(db.all).bind(db)(sql);
+  return contracts.map(contract => contract.address);
 }
 
-// Function to update the last processed state
-async function updateLastProcessedState(codeId, blockHeight) {
-  await promisify(db.run).bind(db)(
-    'INSERT OR REPLACE INTO indexer_progress (id, last_processed_code_id, last_processed_block_height) VALUES (1, ?, ?)',
-    [codeId, blockHeight]
-  );
+// Update contract type in the database
+async function updateContractType(contractAddress, contractType) {
+  const sql = "UPDATE contracts SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sql, [contractType, contractAddress]);
+
+  const sqlInfo = "UPDATE contract_info SET type = ? WHERE address = ?";
+  await promisify(db.run).bind(db)(sqlInfo, [contractType, contractAddress]);
+
+  log(`Updated contract ${contractAddress} with type ${contractType}`);
 }
 
-// Create an axios instance with the API key and block height header
-function createApiInstance() {
-  const headers = { 'x-api-key': API_KEY };
-  if (BLOCK_HEIGHT !== null) {
-    headers['x-cosmos-block-height'] = BLOCK_HEIGHT.toString();
+// Step 1: Retroactively determine contract types using the test query
+async function determineContractTypes() {
+  log('Determining contract types...');
+  const contracts = await fetchContractsWithoutType();
+
+  for (const contractAddress of contracts) {
+    log(`Checking contract type for ${contractAddress}...`);
+    try {
+      const contractType = await determineContractType(restAddress, contractAddress);
+
+      if (contractType) {
+        await updateContractType(contractAddress, contractType);
+        log(`Contract ${contractAddress} is labeled as ${contractType}`);
+      } else {
+        log(`Could not determine contract type for ${contractAddress}.`);
+      }
+    } catch (error) {
+      log(`Error determining contract type for ${contractAddress}: ${error.message}`);
+    }
   }
-  return axios.create({
-    baseURL: restAddress,
-    headers: headers
-  });
+
+  log('Finished determining contract types.');
+}
+
+// Step 2: Iterate over all CW721 contracts to query token IDs and owners
+async function processCW721Contracts() {
+  const sql = "SELECT address FROM contracts WHERE type = 'CW721'";
+  const cw721Contracts = await promisify(db.all).bind(db)(sql);
+
+  for (const contract of cw721Contracts) {
+    const contractAddress = contract.address;
+    log(`Querying tokens for CW721 contract ${contractAddress}...`);
+
+    try {
+      await handleContract(restAddress, contractAddress, db);
+    } catch (error) {
+      log(`Error processing CW721 contract ${contractAddress}: ${error.message}`);
+    }
+  }
+}
+
+// Function to get the last processed state from the database
+async function getLastProcessedState() {
+  try {
+    const result = await promisify(db.get).bind(db)('SELECT * FROM indexer_progress WHERE id = 1');
+    return result || { last_processed_code_id: 0, last_processed_block_height: 0 };
+  } catch (error) {
+    log(`Error retrieving last processed state: ${error.message}`);
+    return { last_processed_code_id: 0, last_processed_block_height: 0 }; // Default values
+  }
 }
 
 // Retry operation with exponential backoff
 async function retryOperation(operation, maxRetries = MAX_RETRIES) {
   for (let i = 0; i < maxRetries; i++) {
     try {
+      // Attempt the operation
       return await operation();
     } catch (error) {
       log(`Attempt ${i + 1} failed: ${error.message}`);
+      // If it's the last retry, throw the error
       if (i === maxRetries - 1) {
         log('Max retries reached. Operation failed.');
         throw error;
       }
+      // Otherwise, wait before retrying
       log(`Retrying operation in ${RETRY_DELAY * Math.pow(2, i)} ms...`);
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * Math.pow(2, i)));
     }
   }
-}
-
-// Worker function to process code infos and contracts
-async function workerFunction(workerId, codeInfos, startBlockHeight) {
-  const api = createApiInstance();
-  const contractsBatch = [];
-  const contractHistoryBatch = [];
-  const contractInfoBatch = [];
-
-  for (const [codeInfoIndex, codeInfo] of codeInfos.entries()) {
-    try {
-      log(`Worker ${workerId}: Processing code info ${codeInfoIndex + 1}/${codeInfos.length} (ID: ${codeInfo.code_id})`);
-
-      let nextKey = null;
-      let totalContracts = 0;
-      do {
-        const response = await retryOperation(() => api.get(`/cosmwasm/wasm/v1/code/${codeInfo.code_id}/contracts`, {
-          params: { 'pagination.key': nextKey }
-        }));
-        const data = response.data;
-        log(`Worker ${workerId}: Received ${data.contracts.length} contracts for code ID ${codeInfo.code_id}. Total so far: ${totalContracts + data.contracts.length}`);
-
-        for (const [contractIndex, contractAddress] of data.contracts.entries()) {
-          totalContracts++;
-          log(`Worker ${workerId}: Processing contract ${contractIndex + 1}/${data.contracts.length} (Total: ${totalContracts}) for code ID ${codeInfo.code_id}`);
-
-          const existingContract = await promisify(db.get).bind(db)('SELECT * FROM contracts WHERE address = ?', [contractAddress]);
-          if (existingContract) {
-            log(`Worker ${workerId}: Contract ${contractAddress} already exists. Skipping.`);
-            continue;
-          }
-
-          const contractType = await determineContractType(restAddress, contractAddress, BLOCK_HEIGHT);
-          contractsBatch.push({ address: contractAddress, code_id: codeInfo.code_id, type: contractType });
-
-          const historyResponse = await retryOperation(() => api.get(`/cosmwasm/wasm/v1/contract/${contractAddress}/history`));
-          for (const entry of historyResponse.data.entries) {
-            contractHistoryBatch.push({
-              address: contractAddress,
-              operation: entry.operation,
-              code_id: entry.code_id,
-              msg: entry.msg
-            });
-          }
-
-          const infoResponse = await retryOperation(() => api.get(`/cosmwasm/wasm/v1/contract/${contractAddress}`));
-          const contractInfo = infoResponse.data.contract_info;
-          contractInfoBatch.push({
-            address: contractAddress,
-            code_id: contractInfo.code_id,
-            creator: contractInfo.creator,
-            admin: contractInfo.admin,
-            label: contractInfo.label,
-            ibc_port_id: contractInfo.ibc_port_id,
-            type: contractType
-          });
-
-          if (['CW721', 'CW1155', 'CW404'].includes(contractType)) {
-            await handleContract(restAddress, contractAddress, db, BLOCK_HEIGHT);
-          }
-
-          if (contractsBatch.length >= BATCH_SIZE) {
-            await batchInsert(db, 'contracts', contractsBatch);
-            contractsBatch.length = 0;
-          }
-          if (contractHistoryBatch.length >= BATCH_SIZE) {
-            await batchInsert(db, 'contract_history', contractHistoryBatch);
-            contractHistoryBatch.length = 0;
-          }
-          if (contractInfoBatch.length >= BATCH_SIZE) {
-            await batchInsert(db, 'contract_info', contractInfoBatch);
-            contractInfoBatch.length = 0;
-          }
-
-          await updateLastProcessedState(codeInfo.code_id, startBlockHeight);
-        }
-
-        nextKey = data.pagination.next_key;
-        log(`Worker ${workerId}: Processed ${totalContracts} contracts for code ID ${codeInfo.code_id} so far. Next key: ${nextKey || 'None'}`);
-      } while (nextKey);
-
-      log(`Worker ${workerId}: Finished processing all contracts for code ID ${codeInfo.code_id}. Total processed: ${totalContracts}`);
-    } catch (error) {
-      log(`Worker ${workerId}: Error processing code info ${codeInfo.code_id}: ${error.message}`);
-      if (error.response) {
-        log(`Worker ${workerId}: Response status: ${error.response.status}`);
-        log(`Worker ${workerId}: Response data: ${JSON.stringify(error.response.data)}`);
-      }
-    }
-  }
-
-  if (contractsBatch.length > 0) await batchInsert(db, 'contracts', contractsBatch);
-  if (contractHistoryBatch.length > 0) await batchInsert(db, 'contract_history', contractHistoryBatch);
-  if (contractInfoBatch.length > 0) await batchInsert(db, 'contract_info', contractInfoBatch);
-
-  parentPort.postMessage('done');
 }
 
 // WebSocket connection and subscription
@@ -318,7 +238,7 @@ function setupWebSocket() {
             label: events['instantiate.label'] ? events['instantiate.label'][0] : ''
           };
           log(`Detected new contract: ${instantiateEvent._contract_address}`);
-          await processNewContract(instantiateEvent);
+          await determineContractTypes();
         }
       }
     } catch (error) {
@@ -336,35 +256,6 @@ function setupWebSocket() {
   });
 }
 
-// Process a newly detected contract
-async function processNewContract(instantiateEvent) {
-  const contractAddress = instantiateEvent._contract_address;
-  const contractType = await determineContractType(restAddress, contractAddress, BLOCK_HEIGHT);
-
-  await batchInsert(db, 'contracts', [{
-    address: contractAddress,
-    code_id: instantiateEvent.code_id,
-    admin: instantiateEvent.admin,
-    creator: instantiateEvent.sender,
-    type: contractType
-  }]);
-
-  await batchInsert(db, 'contract_info', [{
-    address: contractAddress,
-    code_id: instantiateEvent.code_id,
-    creator: instantiateEvent.sender,
-    admin: instantiateEvent.admin,
-    label: instantiateEvent.label,
-    type: contractType
-  }]);
-
-  if (['CW721', 'CW1155', 'CW404'].includes(contractType)) {
-    await handleContract(restAddress, contractAddress, db, BLOCK_HEIGHT);
-  }
-
-  await updatePointerAddresses(db, [contractAddress]);
-}
-
 async function main() {
   try {
     setupLogging();
@@ -373,26 +264,31 @@ async function main() {
 
     log(`Using block height: ${BLOCK_HEIGHT === null ? 'latest' : BLOCK_HEIGHT}`);
 
-    const api = createApiInstance();
-
     const { last_processed_code_id, last_processed_block_height } = await getLastProcessedState();
     log(`Resuming from Code ID: ${last_processed_code_id}, Block Height: ${last_processed_block_height}`);
+    
+    // Check and fix missing data
+    await checkAndFixMissingContractTypes(db, restAddress);
+    await checkAndFixMissingTokens(db, restAddress);
+    await checkAndFixMissingOwners(db, restAddress);
 
-    const latestBlockResponse = await retryOperation(() => api.get('/cosmos/base/tendermint/v1beta1/blocks/latest'));
-    const currentBlockHeight = parseInt(latestBlockResponse.data.block.header.height);
+    // Fetch all tokens for contracts (CW721 and CW1155)
+    await fetchAllTokensForContracts(restAddress, db);
 
-    // Fetch all code IDs
+    // Fetch and store token owners for the fetched tokens
+    await fetchTokenOwners(restAddress, db);
+
+    // Get the latest block height
+    const latestBlockResponse = await retryOperation(() => fetch(`${restAddress}/cosmos/base/tendermint/v1beta1/blocks/latest`));
+    const latestBlockData = await latestBlockResponse.json();
+    const currentBlockHeight = parseInt(latestBlockData.block.header.height);
+
+    // Fetch contract code info
     const codeInfos = [];
     let nextKey = null;
     do {
-      const response = await retryOperation(() => api.get('/cosmwasm/wasm/v1/code', {
-        params: {
-          'pagination.key': nextKey,
-          'pagination.reverse': false,
-          'pagination.limit': 100
-        }
-      }));
-      const data = response.data;
+      const response = await retryOperation(() => fetch(`${restAddress}/cosmwasm/wasm/v1/code?pagination.key=${nextKey}&pagination.reverse=false&pagination.limit=100`));
+      const data = await response.json();
       const newCodeInfos = data.code_infos
         .filter(info => parseInt(info.code_id) > last_processed_code_id)
         .map(info => ({
@@ -406,56 +302,16 @@ async function main() {
       log(`Fetched ${codeInfos.length} new code infos so far. Next key: ${nextKey || 'None'}`);
     } while (nextKey);
 
-    log(`Fetched a total of ${codeInfos.length} new code infos. Starting processing.`);
-
-    // Insert code infos into the database
-    for (let i = 0; i < codeInfos.length; i += BATCH_SIZE) {
-      const batch = codeInfos.slice(i, i + BATCH_SIZE);
-      await batchInsert(db, 'code_infos', batch);
-    }
+    log(`Fetched a total of ${codeInfos.length} new code infos. Starting processing with workers.`);
 
     // Process contracts using workers
-    const chunkSize = Math.ceil(codeInfos.length / NUM_WORKERS);
-    const workers = [];
+    await processContractsWithWorkers(codeInfos, currentBlockHeight);
 
-    for (let i = 0; i < NUM_WORKERS; i++) {
-      const start = i * chunkSize;
-      const end = start + chunkSize;
-      const worker = new Worker(__filename, {
-        workerData: {
-          workerId: i,
-          codeInfos: codeInfos.slice(start, end),
-          startBlockHeight: currentBlockHeight
-        }
-      });
-
-      worker.on('error', (err) => {
-        log(`Worker ${i} encountered an error: ${err.message}`);
-        worker.terminate();
-        log(`Worker ${i} terminated. Restarting...`);
-        
-        const retryWorker = new Worker(__filename, {
-          workerData: {
-            workerId: i,
-            codeInfos: codeInfos.slice(start, end),
-            startBlockHeight: currentBlockHeight
-          }
-        });
-
-        retryWorker.on('message', resolve);
-      });
-
-      workers.push(worker);
-    }
-
-    await Promise.all(workers.map(worker => new Promise((resolve) => {
-      worker.on('message', resolve);
-    })));
-
-    // Update pointer addresses and EVM addresses
+    // Update pointer and EVM addresses after contract processing
     await updatePointerAddresses(db);
     await updateEVMAddresses(db);
 
+    // Update the last processed state if new code infos were fetched
     if (codeInfos.length > 0) {
       const lastCodeId = codeInfos[codeInfos.length - 1].code_id;
       await updateLastProcessedState(lastCodeId, currentBlockHeight);
@@ -463,6 +319,7 @@ async function main() {
 
     log('Data collection completed successfully.');
 
+    // Set up WebSocket if no specific block height is provided
     if (BLOCK_HEIGHT === null) {
       setupWebSocket();
     } else {
@@ -492,17 +349,4 @@ async function main() {
   }
 }
 
-if (isMainThread) {
-  main().catch(error => {
-    console.error(`Unhandled error in main: ${error.message}`);
-    console.error(error.stack);
-    process.exit(1);
-  });
-} else {
-  workerFunction(workerData.workerId, workerData.codeInfos, workerData.startBlockHeight)
-    .catch(error => {
-      console.error(`Unhandled error in worker: ${error.message}`);
-      console.error(error.stack);
-      process.exit(1);
-    });
-}
+main();

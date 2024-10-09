@@ -1,6 +1,13 @@
-const axios = require('axios');
-const { Buffer } = require('buffer');
-const { promisify } = require('util');
+import fetch from 'node-fetch';
+import { Buffer } from 'buffer';
+import { promisify } from 'util';
+import { 
+  POINTER_API_URL, 
+  SEIEVM_API_URL, 
+  restAddress, 
+  BLOCK_HEIGHT 
+} from './config.js';
+
 
 // Helper function to log messages
 function log(message) {
@@ -19,14 +26,12 @@ async function sendContractQuery(rpcEndpoint, contractAddress, payload, blockHei
   }
 
   try {
-    const response = await axios.get(url, { headers });
-    return { data: response.data, status: response.status };
+    const response = await fetch(url, { headers });
+    const data = await response.json();
+    return { data, status: response.status };
   } catch (error) {
     log(`Error querying contract ${contractAddress}: ${error.message}`);
-    if (error.response) {
-      log(`Status Code: ${error.response.status}, Data: ${JSON.stringify(error.response.data)}`);
-    }
-    return { error: error.response?.data || error.message, status: error.response?.status || 500 };
+    return { error: error.message, status: 500 };
   }
 }
 
@@ -45,7 +50,7 @@ async function determineContractType(rpcEndpoint, contractAddress, blockHeight =
     } else if (errorMessage.includes('cw20')) {
       log(`Contract ${contractAddress} determined to be CW20`);
       return 'CW20';
-    } else if (errorMessage.includes('erc1155')) {
+    } else if (errorMessage.includes('cw1155')) {
       log(`Contract ${contractAddress} determined to be CW1155`);
       return 'CW1155';
     } else if (errorMessage.includes('cw404')) {
@@ -78,7 +83,6 @@ async function queryAllTokens(rpcEndpoint, contractAddress, blockHeight = null) 
 async function queryTokenOwner(rpcEndpoint, contractAddress, token_id, blockHeight = null) {
   log(`Querying owner for token ID: ${token_id} in contract: ${contractAddress}`);
 
-  // Ensure token_id is passed as a string
   const ownerQueryPayload = { owner_of: { token_id: token_id.toString() } };
   
   const { data, error, status } = await sendContractQuery(rpcEndpoint, contractAddress, ownerQueryPayload, blockHeight);
@@ -101,12 +105,10 @@ async function fetchAllTokensForContracts(rpcEndpoint, db, batchSize = 50, block
     const contractAddress = contract.address;
     const tokens = await queryAllTokens(rpcEndpoint, contractAddress, blockHeight);
 
-    // Process tokens in batches for better performance
     for (let i = 0; i < tokens.length; i += batchSize) {
       const tokenBatch = tokens.slice(i, i + batchSize);
       const tokenIdsStr = tokenBatch.join(',');
 
-      // Store token IDs in the contract_tokens table
       const insertContractSQL = `INSERT OR REPLACE INTO contract_tokens (contract_address, extra_data) VALUES (?, ?)`;
       await retryDatabaseOperation(() => promisify(db.run).bind(db)(insertContractSQL, [contractAddress, tokenIdsStr]));
 
@@ -143,29 +145,41 @@ async function fetchTokenOwners(rpcEndpoint, db, batchSize = 50, blockHeight = n
   }
 }
 
-// Main function to handle the CW721 contract
+// Main function to handle CW404, CW721, and CW1155 contracts
 async function handleContract(rpcEndpoint, contractAddress, db, blockHeight = null) {
   log(`Handling contract ${contractAddress}...`);
 
+  // First, determine the contract type (CW721, CW1155, or CW404)
+  const contractType = await determineContractType(rpcEndpoint, contractAddress, blockHeight);
+
+  if (contractType === 'CW404') {
+    log(`Contract ${contractAddress} is a CW404 type. No tokens or ownership records to process.`);
+    return;
+  }
+
+  // Fetch all tokens based on contract type
   const tokens = await queryAllTokens(rpcEndpoint, contractAddress, blockHeight);
 
   if (Array.isArray(tokens) && tokens.length > 0) {
     const tokenIdsStr = tokens.join(',');
 
-    const insertContractSQL = `INSERT OR REPLACE INTO contract_tokens (contract_address, extra_data) VALUES (?, ?)`;
-    await promisify(db.run).bind(db)(insertContractSQL, [contractAddress, tokenIdsStr]);
+    // Insert contract and tokens into the database
+    const insertContractSQL = `INSERT OR REPLACE INTO contract_tokens (contract_address, contract_type, extra_data) VALUES (?, ?, ?)`;
+    await promisify(db.run).bind(db)(insertContractSQL, [contractAddress, contractType, tokenIdsStr]);
 
-    log(`Inserted contract tokens for ${contractAddress}.`);
+    log(`Inserted contract tokens for ${contractAddress} of type ${contractType}.`);
 
+    // For each token, query the owner and insert it into the database
     for (const token_id of tokens) {
       const owner = await queryTokenOwner(rpcEndpoint, contractAddress, token_id, blockHeight);
 
       if (owner) {
-        const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner)
-          VALUES (?, ?, ?)`;
+        const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner) VALUES (?, ?, ?)`;
         await promisify(db.run).bind(db)(insertOwnerSQL, [contractAddress, token_id, owner]);
 
         log(`Recorded ownership: Token ${token_id} owned by ${owner}`);
+      } else {
+        log(`No owner found for token ${token_id} in contract ${contractAddress}.`);
       }
     }
   } else {
@@ -228,29 +242,37 @@ async function batchInsert(db, table, dataArray) {
   });
 }
 
-// New function to query pointer addresses
+// Helper function to query pointer addresses
 async function queryPointerAddresses(addresses) {
-  const POINTER_API_URL = 'https://pointer.basementnodes.ca/';
   try {
-    const response = await axios.post(POINTER_API_URL, { addresses });
-    return response.data;
+    const response = await fetch(POINTER_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ addresses })
+    });
+    const data = await response.json();
+    return data;
   } catch (error) {
     log(`Error querying pointer addresses: ${error.message}`);
     return [];
   }
 }
 
-// New function to query EVM address
+// Helper function to query EVM address
 async function queryEVMAddress(bech32Address) {
-  const SEIEVM_API_URL = 'http://tasty.seipex.fi:8545/';
   try {
-    const response = await axios.post(SEIEVM_API_URL, {
-      jsonrpc: '2.0',
-      method: 'sei_getEVMAddress',
-      params: [bech32Address],
-      id: 1
+    const response = await fetch(SEIEVM_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'sei_getEVMAddress',
+        params: [bech32Address],
+        id: 1
+      })
     });
-    return response.data.result;
+    const data = await response.json();
+    return data.result;
   } catch (error) {
     log(`Error querying EVM address for ${bech32Address}: ${error.message}`);
     return null;
@@ -302,12 +324,60 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-module.exports = {
+// Function to check and fix missing contract types
+async function checkAndFixMissingContractTypes(db, rpcEndpoint) {
+  log('Checking for missing contract types...');
+  const sql = 'SELECT address FROM contracts WHERE type IS NULL OR type = "UNKNOWN"';
+  const contracts = await promisify(db.all).bind(db)(sql);
+
+  for (const contract of contracts) {
+    const contractType = await determineContractType(rpcEndpoint, contract.address);
+    if (contractType) {
+      const updateSql = 'UPDATE contracts SET type = ? WHERE address = ?';
+      await promisify(db.run).bind(db)(updateSql, [contractType, contract.address]);
+      log(`Updated contract ${contract.address} to type ${contractType}`);
+    }
+  }
+}
+
+// Function to check and fix missing tokens
+async function checkAndFixMissingTokens(db, rpcEndpoint) {
+  log('Checking for missing tokens...');
+  const sql = 'SELECT address FROM contracts WHERE type = "CW721"';
+  const cw721Contracts = await promisify(db.all).bind(db)(sql);
+
+  for (const contract of cw721Contracts) {
+    await handleContract(rpcEndpoint, contract.address, db);
+  }
+}
+
+// Function to check and fix missing owners
+async function checkAndFixMissingOwners(db, rpcEndpoint) {
+  log('Checking for missing owners...');
+  const sql = 'SELECT collection_address, token_id FROM nft_owners WHERE owner IS NULL';
+  const tokens = await promisify(db.all).bind(db)(sql);
+
+  for (const token of tokens) {
+    const owner = await queryTokenOwner(rpcEndpoint, token.collection_address, token.token_id);
+    if (owner) {
+      const updateSql = 'UPDATE nft_owners SET owner = ? WHERE collection_address = ? AND token_id = ?';
+      await promisify(db.run).bind(db)(updateSql, [owner, token.collection_address, token.token_id]);
+      log(`Updated owner for token ${token.token_id} in contract ${token.collection_address} to ${owner}`);
+    }
+  }
+}
+
+// Export all functions
+export {
   handleContract,
   determineContractType,
   fetchAllTokensForContracts,
   fetchTokenOwners,
+  checkAndFixMissingContractTypes,
+  checkAndFixMissingTokens,
+  checkAndFixMissingOwners,
   batchInsert,
   updatePointerAddresses,
-  updateEVMAddresses
+  updateEVMAddresses,
+  log
 };

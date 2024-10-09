@@ -5,7 +5,6 @@ const path = require('path');
 const { promisify } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const {
-  RPC_WEBSOCKET_URL,
   restAddress,
   API_KEY,
   NUM_WORKERS,

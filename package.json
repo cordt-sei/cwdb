@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "CosmWasm database for querying contract and CW721 data",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
     "realtime": "node realtime_index.js",
@@ -11,11 +12,17 @@
     "test": "jest --verbose",
     "dev": "nodemon index.js"
   },
-  "keywords": ["CosmWasm", "blockchain", "NFT", "CW721"],
-  "author": "Cordtus",
+  "keywords": [
+    "CosmWasm",
+    "blockchain",
+    "NFT",
+    "CW721"
+  ],
+  "author": "Cordt Hanson",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.7.3",
+    "axios": "^1.7.7",
+    "node-fetch": "^3.3.2",
     "sqlite3": "^5.1.7",
     "ws": "^8.18.0"
   },

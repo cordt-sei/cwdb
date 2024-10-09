@@ -1,13 +1,13 @@
-// config.js
-module.exports = {
-  RPC_WEBSOCKET_URL: 'wss://rpc.sei-apis.com/websocket',
-  restAddress: 'http://tasty.seipex.fi:1317', 
-  API_KEY: '',
-  DB_PATH: './data/smart_contracts.db',
-  LOG_FILE: './logs/real_time_indexer.log',
-  BATCH_SIZE: 100,
-  MAX_RETRIES: 3,
-  RETRY_DELAY: 1000,
-  NUM_WORKERS: 3,
-  BLOCK_HEIGHT: 107000671, // Set to null for latest block, or specify a number for a specific block height
-};
+export const RPC_WEBSOCKET_URL = 'wss://tasty.seipex.fi/websocket';
+export const restAddress = 'http://tasty.seipex.fi:1317';
+export const API_KEY = 'NULL';
+export const DB_PATH = './data/smart_contracts.db';
+export const LOG_FILE = './logs/real_time_indexer.log';
+export const BATCH_SIZE = 100;
+export const MAX_RETRIES = 3;
+export const RETRY_DELAY = 1000;
+export const NUM_WORKERS = 4;
+export const maxWorkerRetries = 3;
+export const POINTER_API_URL = 'https://pointer.basementnodes.ca/';
+export const SEIEVM_API_URL = 'http://tasty.seipex.fi:8545/';
+export const BLOCK_HEIGHT = 107000671; // Set to null for the latest block, or specify a number for a specific block height
