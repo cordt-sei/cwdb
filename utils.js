@@ -2,12 +2,23 @@
 import axios from 'axios';
 import WebSocket from 'ws';
 import fs from 'fs';
+import path from 'path';
 import { promisify } from 'util';
 
 // Logging function to write to both console and log file
 export function log(message) {
   console.log(message);
-  fs.appendFileSync('./logs/indexer.log', message + '\n');
+  
+  const logDir = './logs';
+  const logFile = path.join(logDir, 'data_collection.log');
+
+  // Ensure the logs directory exists
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+
+  // Append to the log file
+  fs.appendFileSync(logFile, message + '\n');
 }
 
 // Retry logic for API calls with exponential backoff
