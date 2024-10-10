@@ -5,7 +5,7 @@ const { promisify } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 const restAddress = "http://tasty.seipex.fi:1317"
-const NUM_WORKERS = 6;
+const NUM_WORKERS = 3;
 const API_KEY = 'a48f0d74';
 const BATCH_SIZE = 100;
 const MAX_RETRIES = 3;
@@ -16,7 +16,7 @@ let db;
 
 // Set up logging
 function setupLogging() {
-  logStream = fs.createWriteStream('data_collection.log', { flags: 'a' });
+  logStream = fs.createWriteStream('logs/data_collection.log', { flags: 'a' });  // Update log directory to 'logs'
 }
 
 function log(message) {
@@ -31,7 +31,7 @@ function log(message) {
 // Set up database
 async function setupDatabase() {
   return new Promise((resolve, reject) => {
-    db = new sqlite3.Database('./smart_contracts.db', (err) => {
+    db = new sqlite3.Database('./data/smart_contracts.db', (err) => {  // Update database directory to 'data'
       if (err) {
         log(`Error opening database: ${err.message}`);
         reject(err);
