@@ -9,6 +9,7 @@ import {
 } from './utils.js';
 import axios from 'axios';
 import { config } from './config.js';
+
 // Fetch all code IDs and store them in the database
 export async function fetchAndStoreCodeIds(restAddress, db) {
   const dbRun = promisify(db.run).bind(db);
@@ -20,15 +21,25 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
       return;
     }
 
-    let startAfter = progress.last_processed ? parseInt(progress.last_processed) : 0;
+    let startAfter = progress.last_processed ? parseInt(progress.last_processed) : null; // Set to null for the first request
     let allCodeInfos = [];
     let hasMore = true;
 
     while (hasMore) {
+      const payload = {
+        'pagination.reverse': false,
+        'pagination.limit': config.paginationLimit
+      };
+
+      if (startAfter !== null) {
+        // Only add the pagination.key if startAfter is not null (i.e., not the first query)
+        payload['pagination.key'] = Buffer.from(startAfter.toString()).toString('base64');
+      }
+
       const codeInfos = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code`,
         null,
-        { 'pagination.reverse': false, 'pagination.limit': config.paginationLimit, 'pagination.key': Buffer.from(startAfter.toString()).toString('base64') },
+        payload,
         'code_infos'
       );
 
@@ -72,12 +83,25 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
 
     for (let i = startIndex; i < codeIds.length; i++) {
       const code_id = codeIds[i];
-      const contracts = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`, null, {}, 'contracts');
+      let hasMore = true;
+      let nextKey = null;
 
-      for (const contractAddress of contracts) {
-        const insertSQL = `INSERT OR REPLACE INTO contracts (code_id, address) VALUES (?, ?)`;
-        await dbRun(insertSQL, [code_id, contractAddress]);
-        log(`Stored contract address: ${contractAddress} for code_id: ${code_id}`);
+      while (hasMore) {
+        const payload = {};
+        if (nextKey) {
+          payload['pagination.key'] = nextKey;
+        }
+
+        const contracts = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`, null, payload, 'contracts');
+        
+        for (const contractAddress of contracts) {
+          const insertSQL = `INSERT OR REPLACE INTO contracts (code_id, address) VALUES (?, ?)`;
+          await dbRun(insertSQL, [code_id, contractAddress]);
+          log(`Stored contract address: ${contractAddress} for code_id: ${code_id}`);
+        }
+
+        nextKey = response.pagination?.next_key || null;
+        hasMore = contracts.length === config.paginationLimit && nextKey;
       }
 
       log(`Processed ${contracts.length} contracts for code_id: ${code_id}`);
@@ -111,13 +135,26 @@ export async function fetchAndStoreContractHistory(restAddress, db) {
 
     for (let i = startIndex; i < contractAddresses.length; i++) {
       const address = contractAddresses[i];
-      const historyEntries = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/contract/${address}/history`, null, {}, 'entries');
+      let hasMore = true;
+      let nextKey = null;
 
-      for (const entry of historyEntries) {
-        const { operation, code_id, updated, msg } = entry;
-        const insertSQL = `INSERT OR REPLACE INTO contract_history (contract_address, operation, code_id, updated, msg) VALUES (?, ?, ?, ?, ?)`;
-        await dbRun(insertSQL, [address, operation, code_id, updated || null, JSON.stringify(msg)]);
-        log(`Stored history entry for contract ${address}, operation: ${operation}`);
+      while (hasMore) {
+        const payload = {};
+        if (nextKey) {
+          payload['pagination.key'] = nextKey;
+        }
+
+        const historyEntries = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/contract/${address}/history`, null, payload, 'entries');
+        
+        for (const entry of historyEntries) {
+          const { operation, code_id, updated, msg } = entry;
+          const insertSQL = `INSERT OR REPLACE INTO contract_history (contract_address, operation, code_id, updated, msg) VALUES (?, ?, ?, ?, ?)`;
+          await dbRun(insertSQL, [address, operation, code_id, updated || null, JSON.stringify(msg)]);
+          log(`Stored history entry for contract ${address}, operation: ${operation}`);
+        }
+
+        nextKey = response.pagination?.next_key || null;
+        hasMore = historyEntries.length === config.paginationLimit && nextKey;
       }
 
       await updateProgress(db, 'fetchContractHistory', 0, address);
@@ -194,15 +231,26 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
     for (let i = startIndex; i < contractsResult.length; i++) {
       const { address: contractAddress, type: contractType } = contractsResult[i];
       const tokenQueryPayload = { all_tokens: {} };
-      const tokens = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64')}`, null, {}, 'tokens');
+      let hasMore = true;
+      let nextKey = null;
 
-      if (tokens.length > 0) {
-        const tokenIdsStr = tokens.join(',');
-        const insertContractSQL = `INSERT OR REPLACE INTO contract_tokens (contract_address, extra_data, contract_type) VALUES (?, ?, ?)`;
-        await dbRun(insertContractSQL, [contractAddress, tokenIdsStr, contractType]);
-        log(`Stored tokens for ${contractType} contract ${contractAddress}: ${tokens.length} tokens.`);
-      } else {
-        log(`No tokens found for ${contractType} contract ${contractAddress}.`);
+      while (hasMore) {
+        const payload = {};
+        if (nextKey) {
+          payload['pagination.key'] = nextKey;
+        }
+
+        const tokens = await fetchPaginatedData(`${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64')}`, null, payload, 'tokens');
+
+        if (tokens.length > 0) {
+          const tokenIdsStr = tokens.join(',');
+          const insertContractSQL = `INSERT OR REPLACE INTO contract_tokens (contract_address, extra_data, contract_type) VALUES (?, ?, ?)`;
+          await dbRun(insertContractSQL, [contractAddress, tokenIdsStr, contractType]);
+          log(`Stored tokens for ${contractType} contract ${contractAddress}: ${tokens.length} tokens.`);
+        }
+
+        nextKey = response.pagination?.next_key || null;
+        hasMore = tokens.length === config.paginationLimit && nextKey;
       }
 
       await updateProgress(db, 'fetchTokens', 0, contractAddress);
@@ -241,15 +289,26 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
         const token_id = tokenIds[j];
         const ownerQueryPayload = { owner_of: { token_id: token_id.toString() } };
         const headers = { 'x-cosmos-block-height': config.blockHeight.toString() };
-        const { data, status } = await sendContractQuery(restAddress, contractAddress, ownerQueryPayload, headers);
+        let hasMore = true;
+        let nextKey = null;
 
-        if (status === 200 && data && data.owner) {
-          const owner = data.owner;
-          const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type) VALUES (?, ?, ?, ?)`;
-          await dbRun(insertOwnerSQL, [contractAddress, token_id, owner, contractType]);
-          log(`Recorded ownership: Token ${token_id} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
-        } else {
-          log(`No owner found for token ID: ${token_id} in ${contractType} contract ${contractAddress}.`);
+        while (hasMore) {
+          const payload = {};
+          if (nextKey) {
+            payload['pagination.key'] = nextKey;
+          }
+
+          const { data, status } = await sendContractQuery(restAddress, contractAddress, ownerQueryPayload, headers);
+
+          if (status === 200 && data && data.owner) {
+            const owner = data.owner;
+            const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type) VALUES (?, ?, ?, ?)`;
+            await dbRun(insertOwnerSQL, [contractAddress, token_id, owner, contractType]);
+            log(`Recorded ownership: Token ${token_id} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
+          }
+
+          nextKey = response.pagination?.next_key || null;
+          hasMore = tokenIds.length === config.paginationLimit && nextKey;
         }
 
         await updateProgress(db, 'fetchTokenOwners', 0, `${contractAddress}:${j}`);

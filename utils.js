@@ -43,37 +43,41 @@ export async function fetchPaginatedData(url, contractAddress, payload, key, bat
 
   do {
     const params = new URLSearchParams(payload);
+    
+    // Add the pagination.key only if nextKey exists (for subsequent queries)
     if (nextKey) {
       params.set('pagination.key', nextKey);
     }
     params.set('pagination.limit', batchSize.toString());
 
     const fullUrl = `${url}?${params.toString()}`;
+    log(`Fetching data from: ${fullUrl}`); // Log the constructed URL
     const response = await retryOperation(() => axios.get(fullUrl));
 
     if (response.status === 200 && response.data) {
+      log(`Full API response: ${JSON.stringify(response.data)}`); // Log the entire API response for debugging
+
+      // Fetch the requested data using the key
       const dataBatch = response.data[key] || [];
       allData = allData.concat(dataBatch);
+      log(`Fetched ${dataBatch.length} items in this batch.`);
 
-      // Check if the response has pagination information
-      if (response.data.pagination) {
+      // Handle pagination only if it exists
+      if (response.data.pagination && response.data.pagination.next_key) {
+        log(`Pagination detected. Next key: ${response.data.pagination.next_key}`);
         nextKey = response.data.pagination.next_key;
       } else {
-        // If there's no pagination info, we're done after the first iteration
-        nextKey = null;
+        log('No pagination or no next key detected. Exiting loop.');
+        nextKey = null; // Ensure loop exits if no pagination exists
       }
     } else {
       throw new Error(`Unexpected response: ${JSON.stringify(response.data)}`);
     }
 
-    // If it's not paginated, break after the first iteration
-    if (firstIteration && !response.data.pagination) {
-      break;
-    }
-
     firstIteration = false;
   } while (nextKey);
 
+  log(`Total data fetched: ${allData.length}`); // Log the total fetched data
   return allData;
 }
 
@@ -97,14 +101,24 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
 export async function checkProgress(db, step) {
   const dbGet = promisify(db.get).bind(db);
   const sql = `SELECT completed, last_processed FROM indexer_progress WHERE step = ?`;
-  const result = await dbGet(sql, [step]);
-  return result || { completed: 0, last_processed: null };
+  try {
+    const result = await dbGet(sql, [step]);
+    return result || { completed: 0, last_processed: null };
+  } catch (error) {
+    console.error(`Error checking progress for step ${step}:`, error);
+    return { completed: 0, last_processed: null };
+  }
 }
 
-export async function updateProgress(db, step, completed = 0, lastProcessed = null) {
+export async function updateProgress(db, step, completed = 1, lastProcessed = null) {
   const dbRun = promisify(db.run).bind(db);
   const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed) VALUES (?, ?, ?)`;
-  await dbRun(sql, [step, completed, lastProcessed]);
+  try {
+    await dbRun(sql, [step, completed, lastProcessed]);
+  } catch (error) {
+    console.error(`Error updating progress for step ${step}:`, error);
+    throw error;
+  }
 }
 
 // WebSocket setup function
