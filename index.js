@@ -1,4 +1,5 @@
 // index.js
+
 import { 
   fetchAndStoreCodeIds, 
   fetchAndStoreContractsByCode, 
@@ -9,8 +10,12 @@ import {
   fetchAndStorePointerData, 
   fetchAndStoreAssociatedWallets 
 } from './cw721Helper.js';
-import { setupWebSocket, log } from './utils.js';
-import { Worker } from 'worker_threads';
+import { 
+  setupWebSocket, 
+  log, 
+  checkProgress, 
+  updateProgress 
+} from './utils.js';
 import { config } from './config.js';
 import sqlite3 from 'sqlite3';
 import fs from 'fs';
@@ -25,6 +30,13 @@ initializeDatabase(db);
 
 // Create necessary tables if they don't exist
 function initializeDatabase(db) {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS indexer_progress (
+      step TEXT PRIMARY KEY,
+      completed INTEGER DEFAULT 0,
+      last_processed TEXT
+    )`);
+
   db.run(`
     CREATE TABLE IF NOT EXISTS code_ids (
       code_id TEXT PRIMARY KEY,
@@ -77,103 +89,78 @@ function initializeDatabase(db) {
   console.log('Database tables initialized.');
 }
 
-// Helper function to get contract tokens (token IDs) from the database
-async function getContractTokens(db) {
-  const sql = "SELECT contract_address, extra_data FROM contract_tokens"; // Fetch stored token data
-  return new Promise((resolve, reject) => {
-    db.all(sql, (err, rows) => {
-      if (err) reject(err);
-      resolve(rows.map(row => ({
-        contract_address: row.contract_address,
-        token_ids: row.extra_data.split(',') // Token IDs stored as a comma-separated string
-      })));
-    });
-  });
-}
-
-// Helper function to get all contracts to process
-async function getContractsToProcess(db, type = '') {
-  const sql = type ? `SELECT address FROM contracts WHERE type = '${type}'` : `SELECT address FROM contracts`;
-  return new Promise((resolve, reject) => {
-    db.all(sql, (err, rows) => {
-      if (err) reject(err);
-      resolve(rows.map(row => row.address));
-    });
-  });
-}
-
-// Helper function to get all unique owners
-async function getAllOwners(db) {
-  const sql = "SELECT DISTINCT owner FROM nft_owners";
-  return new Promise((resolve, reject) => {
-    db.all(sql, (err, rows) => {
-      if (err) reject(err);
-      resolve(rows.map(row => row.owner));
-    });
-  });
-}
-
-// Multi-threading logic for speeding up the queries
-async function runMultiThreadedQueries(taskType, dataToProcess) {
-  const chunkSize = Math.ceil(dataToProcess.length / config.numWorkers);
-  const workerPromises = [];
-
-  for (let i = 0; i < config.numWorkers; i++) {
-    const workerData = dataToProcess.slice(i * chunkSize, (i + 1) * chunkSize);
-
-    const worker = new Worker('./workerTask.js', {
-      workerData: {
-        restAddress: config.restAddress,
-        dbFilePath: './data/indexer.db', // Pass the SQLite DB path to worker
-        contractsToProcess: workerData,
-        taskType
-      }
-    });
-
-    workerPromises.push(new Promise((resolve, reject) => {
-      worker.on('message', resolve);
-      worker.on('error', reject);
-    }));
-  }
-
-  return Promise.all(workerPromises);
-}
-
 // index.js
 async function runIndexer() {
   try {
-    // Step 1: Fetch and store all code IDs
-    await fetchAndStoreCodeIds(config.restAddress, db);
+    let progress;
 
-    // Step 2: Fetch and store contracts for all code IDs
-    await fetchAndStoreContractsByCode(config.restAddress, db);
+    // Fetch and store all code IDs
+    progress = await checkProgress(db, 'fetchCodeIds');
+    if (!progress.completed) {
+      await fetchAndStoreCodeIds(config.restAddress, db);
+      await updateProgress(db, 'fetchCodeIds');
+    }
 
-    // Step 3: Fetch contract history
-    await fetchAndStoreContractHistory(config.restAddress, db);
+    // Fetch and store contracts for all code IDs
+    progress = await checkProgress(db, 'fetchContracts');
+    if (!progress.completed) {
+      await fetchAndStoreContractsByCode(config.restAddress, db);
+      await updateProgress(db, 'fetchContracts');
+    }
 
-    // Step 4: Identify contract types
-    await identifyContractTypes(config.restAddress, db);
+    // Fetch contract history
+    progress = await checkProgress(db, 'fetchContractHistory');
+    if (!progress.completed) {
+      await fetchAndStoreContractHistory(config.restAddress, db);
+      await updateProgress(db, 'fetchContractHistory');
+    }
 
-    // Step 5: Fetch and store token IDs for CW721 contracts
-    await fetchAndStoreTokensForContracts(config.restAddress, db);
+    // Identify contract types
+    progress = await checkProgress(db, 'identifyContractTypes');
+    if (!progress.completed) {
+      await identifyContractTypes(config.restAddress, db);
+      await updateProgress(db, 'identifyContractTypes');
+    }
 
-    // Step 6: Fetch and store token ownership details
-    await fetchAndStoreTokenOwners(config.restAddress, db);
+    // Fetch and store token IDs for CW721, CW404, and CW1155 contracts
+    progress = await checkProgress(db, 'fetchTokens');
+    if (!progress.completed) {
+      await fetchAndStoreTokensForContracts(config.restAddress, db);
+      await updateProgress(db, 'fetchTokens');
+    }
 
-    // Step 7: Fetch and store pointer data
-    await fetchAndStorePointerData(config.pointerApi, db);
+    // Fetch and store token ownership details
+    progress = await checkProgress(db, 'fetchTokenOwners');
+    if (!progress.completed) {
+      await fetchAndStoreTokenOwners(config.restAddress, db);
+      await updateProgress(db, 'fetchTokenOwners');
+    }
 
-    // Step 8: Fetch and store associated wallet addresses
-    await fetchAndStoreAssociatedWallets(config.evmRpcAddress, db);
+    // Fetch and store pointer data
+    progress = await checkProgress(db, 'fetchPointerData');
+    if (!progress.completed) {
+      await fetchAndStorePointerData(config.pointerApi, db);
+      await updateProgress(db, 'fetchPointerData');
+    }
 
-    // Step 9: Enter WebSocket monitoring mode
+    // Fetch and store associated wallet addresses
+    progress = await checkProgress(db, 'fetchAssociatedWallets');
+    if (!progress.completed) {
+      await fetchAndStoreAssociatedWallets(config.evmRpcAddress, db);
+      await updateProgress(db, 'fetchAssociatedWallets');
+    }
+
+    log('All indexing steps completed successfully.');
+
+    // WebSocket monitoring mode (WIP)
+    // Not included in the resume functionality as it's WIP
     setupWebSocket(config.wsAddress, handleMessage, log);
   } catch (error) {
     log(`Error running indexer: ${error.message}`);
   }
 }
 
-// WebSocket message handler for real-time updates
+// WebSocket message handler for real-time updates (WIP)
 function handleMessage(message) {
   log('Received message:', message);
   // Handle new data entries from WebSocket

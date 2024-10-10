@@ -2,6 +2,7 @@
 import axios from 'axios';
 import WebSocket from 'ws';
 import fs from 'fs';
+import { promisify } from 'util';
 
 // Logging function to write to both console and log file
 export function log(message) {
@@ -26,7 +27,8 @@ export async function retryOperation(operation, maxRetries = 3) {
 
 export async function fetchPaginatedData(url, contractAddress, payload, key, batchSize = 100) {
   let allData = [];
-  let nextKey = null;
+  let nextKey = payload['pagination.key'] || null;
+  let firstIteration = true;
 
   do {
     const params = new URLSearchParams(payload);
@@ -42,10 +44,23 @@ export async function fetchPaginatedData(url, contractAddress, payload, key, bat
       const dataBatch = response.data[key] || [];
       allData = allData.concat(dataBatch);
 
-      nextKey = response.data.pagination?.next_key || null;
+      // Check if the response has pagination information
+      if (response.data.pagination) {
+        nextKey = response.data.pagination.next_key;
+      } else {
+        // If there's no pagination info, we're done after the first iteration
+        nextKey = null;
+      }
     } else {
       throw new Error(`Unexpected response: ${JSON.stringify(response.data)}`);
     }
+
+    // If it's not paginated, break after the first iteration
+    if (firstIteration && !response.data.pagination) {
+      break;
+    }
+
+    firstIteration = false;
   } while (nextKey);
 
   return allData;
@@ -66,6 +81,19 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
     }
     return { error: error.response?.data || error.message, status: error.response?.status || 500 };
   }
+}
+
+export async function checkProgress(db, step) {
+  const dbGet = promisify(db.get).bind(db);
+  const sql = `SELECT completed, last_processed FROM indexer_progress WHERE step = ?`;
+  const result = await dbGet(sql, [step]);
+  return result || { completed: 0, last_processed: null };
+}
+
+export async function updateProgress(db, step, completed = 0, lastProcessed = null) {
+  const dbRun = promisify(db.run).bind(db);
+  const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed) VALUES (?, ?, ?)`;
+  await dbRun(sql, [step, completed, lastProcessed]);
 }
 
 // WebSocket setup function
@@ -96,3 +124,5 @@ export function setupWebSocket(url, messageHandler, log) {
 
   return ws;  // Return the WebSocket instance for external control if needed
 }
+
+export { promisify } from 'util';
