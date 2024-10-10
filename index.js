@@ -5,7 +5,7 @@ const { promisify } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 
 const restAddress = "http://tasty.seipex.fi:1317"
-const NUM_WORKERS = 3;
+const NUM_WORKERS = 6;
 const API_KEY = 'a48f0d74';
 const BATCH_SIZE = 100;
 const MAX_RETRIES = 3;

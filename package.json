@@ -11,11 +11,17 @@
     "test": "jest --verbose",
     "dev": "nodemon index.js"
   },
-  "keywords": ["CosmWasm", "blockchain", "NFT", "CW721"],
+  "keywords": [
+    "CosmWasm",
+    "blockchain",
+    "NFT",
+    "CW721"
+  ],
   "author": "Cordtus",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.7.3",
+    "path": "^0.12.7",
     "sqlite3": "^5.1.7",
     "ws": "^8.18.0"
   },
