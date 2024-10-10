@@ -52,12 +52,12 @@ export async function fetchPaginatedData(url, contractAddress, payload, key, bat
 }
 
 // Helper function to send a smart contract query
-export async function sendContractQuery(restAddress, contractAddress, payload) {
+export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
 
   try {
-    const response = await retryOperation(() => axios.get(url));
+    const response = await retryOperation(() => axios.get(url, { headers }));
     return { data: response.data, status: response.status };
   } catch (error) {
     log(`Error querying contract ${contractAddress}: ${error.message}`);

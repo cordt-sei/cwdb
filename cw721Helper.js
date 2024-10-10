@@ -160,13 +160,14 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
 
       for (const token_id of tokenIds) {
         const ownerQueryPayload = { owner_of: { token_id: token_id.toString() } };
-        const { data, status } = await sendContractQuery(restAddress, contractAddress, ownerQueryPayload);
+        const headers = { 'x-cosmos-block-height': config.blockHeight.toString() };
+        const { data, status } = await sendContractQuery(restAddress, contractAddress, ownerQueryPayload, headers);
 
         if (status === 200 && data && data.owner) {
           const owner = data.owner;
 
           const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type) VALUES (?, ?, ?, ?)`;
-          await dbRun(insertOwnerSQL, [contractAddress, token_id, owner, contractType]);
+          await dbRun(insertSQL, [contractAddress, token_id, owner, contractType]);
 
           log(`Recorded ownership: Token ${token_id} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
         } else {
