@@ -21,18 +21,18 @@ export function log(message) {
   fs.appendFileSync(logFile, message + '\n');
 }
 
-// Retry logic for API calls with exponential backoff
-export async function retryOperation(operation, maxRetries = 3) {
-  let attempt = 0;
-  while (attempt < maxRetries) {
-    try {
-      return await operation();
-    } catch (error) {
-      attempt++;
-      log(`Attempt ${attempt} failed. Retrying...`);
-      if (attempt === maxRetries) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));  // Exponential backoff
+// Simple operation function without retry logic, throwing actual error response
+export async function retryOperation(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    // Log the full error details, including the response if available
+    if (error.response) {
+      log(`Operation failed with status ${error.response.status}: ${JSON.stringify(error.response.data)}`);
+    } else {
+      log(`Operation failed: ${error.message}`);
     }
+    throw error;  // Throw the actual error to ensure the response is passed along
   }
 }
 
@@ -81,20 +81,54 @@ export async function fetchPaginatedData(url, contractAddress, payload, key, bat
   return allData;
 }
 
-// Helper function to send a smart contract query
+// Helper function to send a smart contract query and identify contract type
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
+  // Ensure payload is valid
+  if (!payload || typeof payload !== 'object') {
+    log(`Invalid payload provided for contract ${contractAddress}`);
+    return { contractType: 'other' };
+  }
+
+  // Convert payload to base64
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
-    return { data: response.data, status: response.status };
+    return { data: response.data };
   } catch (error) {
-    log(`Error querying contract ${contractAddress}: ${error.message}`);
+    // Check for the error response and attempt to extract contract type
     if (error.response) {
-      log(`Status Code: ${error.response.status}, Data: ${JSON.stringify(error.response.data)}`);
+      const responseMessage = error.response.data?.message || '';
+      const regex = /Error parsing into type (\w+)(::msg::)?/i;
+      const match = responseMessage.match(regex);
+
+      if (match && match[1]) {
+        const contractType = match[1].toLowerCase(); // Capture the full contract type
+        // Remove the log here
+        return { contractType };
+      }
+
+      return { contractType: 'other' };
     }
-    return { error: error.response?.data || error.message, status: error.response?.status || 500 };
+
+    return { contractType: 'other' };
+  }
+}
+
+// batchInsert utility function
+export async function batchInsert(dbRun, tableName, columns, data) {
+  if (data.length === 0) return;
+
+  const placeholders = data.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
+  const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES ${placeholders}`;
+  const flatData = data.flat();
+
+  try {
+    await dbRun(insertSQL, flatData);
+  } catch (error) {
+    log(`Error performing batch insert into ${tableName}: ${error.message}`);
+    throw error;
   }
 }
 
