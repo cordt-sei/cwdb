@@ -355,26 +355,38 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
 
   try {
     const progress = await checkProgress(db, 'fetchTokenOwners');
+    log('Checking progress for fetchTokenOwners...');
     if (progress.completed) {
       log('Skipping fetchAndStoreTokenOwners: Already completed');
       return;
     }
 
     // Query contract_tokens table to get the contract address and token_id
+    log('Querying contract_tokens table...');
     const contractTokensResult = await dbAll('SELECT contract_address, token_id, contract_type FROM contract_tokens');
+    log(`Fetched ${contractTokensResult.length} tokens from contract_tokens.`);
 
+    let processed = 0;
     for (let i = 0; i < contractTokensResult.length; i++) {
       const { contract_address: contractAddress, token_id: tokenId, contract_type: contractType } = contractTokensResult[i];
+      log(`Processing token ${tokenId} for contract ${contractAddress}...`);
 
       // Prepare payload for querying the owner of the token
       const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
       const headers = { 'x-cosmos-block-height': config.blockHeight.toString() };
 
       try {
+        // Query the contract for the token owner
+        log(`Sending query for token ${tokenId} to contract ${contractAddress}...`);
         const { data, status } = await sendContractQuery(restAddress, contractAddress, ownerQueryPayload, headers);
 
-        if (status === 200 && data && data.owner) {
-          const owner = data.owner;
+        // Log the type of status for debugging
+        log(`Status: ${status}, Type of status: ${typeof status}`);
+
+        // Ensure response is valid and contains the 'owner' field correctly as data.data.owner
+        if (typeof status === 'number' && status === 200 && data && data.data && data.data.owner) {
+          const owner = data.data.owner;  // Correctly access the owner field
+          log(`Owner for token ${tokenId} found: ${owner}`);
 
           // Insert owner details into the nft_owners table
           const insertOwnerSQL = `
@@ -382,11 +394,17 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
             VALUES (?, ?, ?, ?)
           `;
           await dbRun(insertOwnerSQL, [contractAddress, tokenId, owner, contractType]);
-
           log(`Recorded ownership: Token ${tokenId} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
+        } else {
+          log(`No valid owner found for contract ${contractAddress}, token ${tokenId}`);
         }
       } catch (err) {
         log(`Error fetching token ownership for contract ${contractAddress}, token ${tokenId}: ${err.message}`);
+      }
+
+      // Log progress every 100 processed tokens
+      if (++processed % 100 === 0) {
+        log(`Processed ${processed} tokens so far.`);
       }
     }
 
@@ -479,30 +497,38 @@ export async function fetchAndStoreAssociatedWallets(evmRpcAddress, db) {
 
   try {
     const ownersResult = await dbAll('SELECT DISTINCT owner FROM nft_owners');
+    log(`Fetched ${ownersResult.length} unique owners from nft_owners table.`);
 
     for (const { owner } of ownersResult) {
       const payload = {
         jsonrpc: "2.0",
-        method: "sei_getSeiAddress",
-        params: [owner],
+        method: "sei_getEVMAddress",
+        params: [owner], // Use the Bech32 address for the lookup
         id: 1
       };
 
-      const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
+      try {
+        // Send the query to the EVM RPC endpoint
+        const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
+        
+        // Check if the response contains a valid result
+        if (response.status === 200 && response.data && response.data.result) {
+          const evmAddress = response.data.result;
 
-      if (response.status === 200 && response.data.result) {
-        const evmAddress = response.data.result;
-
-        const insertSQL = `INSERT OR REPLACE INTO wallet_associations (wallet_address, evm_address) VALUES (?, ?)`;
-        await dbRun(insertSQL, [owner, evmAddress]);
-
-        log(`Stored EVM address: ${evmAddress} for wallet: ${owner}`);
-      } else {
-        log(`Error fetching EVM address for wallet ${owner}: ${response.status}`);
+          // Insert the EVM address into the wallet_associations table
+          const insertSQL = `INSERT OR REPLACE INTO wallet_associations (wallet_address, evm_address) VALUES (?, ?)`;
+          await dbRun(insertSQL, [owner, evmAddress]);
+          
+          log(`Stored EVM address: ${evmAddress} for wallet: ${owner}`);
+        } else {
+          log(`Error fetching EVM address for wallet ${owner}: No valid result`);
+        }
+      } catch (error) {
+        log(`Error fetching EVM address for wallet ${owner}: ${error.message}`);
       }
     }
 
-    log('Finished processing associated wallets');
+    log('Finished processing associated wallets.');
   } catch (error) {
     log(`Error in fetchAndStoreAssociatedWallets: ${error.message}`);
     throw error;

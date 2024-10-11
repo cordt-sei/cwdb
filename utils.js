@@ -80,12 +80,12 @@ export async function fetchPaginatedData(url, payload, key, batchSize = 100) {
   return allData;
 }
 
-// Helper function to send a smart contract query and identify contract type
+// Helper function to send a smart contract query
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
   // Ensure payload is valid
   if (!payload || typeof payload !== 'object') {
     log(`Invalid payload provided for contract ${contractAddress}`);
-    return { contractType: 'other' };
+    return null;
   }
 
   // Convert payload to base64
@@ -94,24 +94,16 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
-    return { data: response.data };
+
+    // Log the full response
+    log(`Full API response for ${contractAddress}, token ${payload.owner_of.token_id}: ${JSON.stringify(response.data)}`);
+    log(`Response status: ${response.status}, Type of status: ${typeof response.status}`);
+
+    // Return both data and status
+    return { data: response.data, status: response.status };
   } catch (error) {
-    // Check for the error response and attempt to extract contract type
-    if (error.response) {
-      const responseMessage = error.response.data?.message || '';
-      const regex = /Error parsing into type (\w+)(::msg::)?/i;
-      const match = responseMessage.match(regex);
-
-      if (match && match[1]) {
-        const contractType = match[1].toLowerCase(); // Capture the full contract type
-        // Remove the log here
-        return { contractType };
-      }
-
-      return { contractType: 'other' };
-    }
-
-    return { contractType: 'other' };
+    log(`Error querying contract ${contractAddress}: ${error.message}`);
+    return null;
   }
 }
 
