@@ -36,48 +36,47 @@ export async function retryOperation(operation) {
   }
 }
 
-export async function fetchPaginatedData(url, contractAddress, payload, key, batchSize = 100) {
+// Helper function to fetch paginated data
+export async function fetchPaginatedData(url, payload, key, batchSize = 100) {
   let allData = [];
-  let nextKey = payload['pagination.key'] || null;
-  let firstIteration = true;
+  let nextKey = payload?.['pagination.key'] || null;
 
   do {
-    const params = new URLSearchParams(payload);
-    
-    // Add the pagination.key only if nextKey exists (for subsequent queries)
+    const params = new URLSearchParams();
     if (nextKey) {
       params.set('pagination.key', nextKey);
     }
     params.set('pagination.limit', batchSize.toString());
 
     const fullUrl = `${url}?${params.toString()}`;
-    log(`Fetching data from: ${fullUrl}`); // Log the constructed URL
+    log(`Fetching data from: ${fullUrl}`);
     const response = await retryOperation(() => axios.get(fullUrl));
 
     if (response.status === 200 && response.data) {
-      log(`Full API response: ${JSON.stringify(response.data)}`); // Log the entire API response for debugging
+      log(`Full API response: ${JSON.stringify(response.data)}`);
 
-      // Fetch the requested data using the key
-      const dataBatch = response.data[key] || [];
-      allData = allData.concat(dataBatch);
-      log(`Fetched ${dataBatch.length} items in this batch.`);
-
-      // Handle pagination only if it exists
-      if (response.data.pagination && response.data.pagination.next_key) {
-        log(`Pagination detected. Next key: ${response.data.pagination.next_key}`);
-        nextKey = response.data.pagination.next_key;
-      } else {
-        log('No pagination or no next key detected. Exiting loop.');
-        nextKey = null; // Ensure loop exits if no pagination exists
+      // Correctly handle the tokens data extraction
+      let dataBatch = [];
+      if (response.data?.data?.[key]) {
+        dataBatch = response.data.data[key];  // Access 'tokens' under 'data'
       }
+
+      if (dataBatch.length > 0) {
+        allData = allData.concat(dataBatch);
+        log(`Fetched ${dataBatch.length} items in this batch.`);
+      } else {
+        log('No items found in this batch.');
+      }
+
+      // Handle pagination if applicable
+      nextKey = response.data?.pagination?.next_key || null;
     } else {
       throw new Error(`Unexpected response: ${JSON.stringify(response.data)}`);
     }
 
-    firstIteration = false;
   } while (nextKey);
 
-  log(`Total data fetched: ${allData.length}`); // Log the total fetched data
+  log(`Total data fetched: ${allData.length}`);
   return allData;
 }
 

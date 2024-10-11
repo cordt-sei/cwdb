@@ -64,7 +64,7 @@ function initializeDatabase(db) {
         )`,
         `CREATE TABLE IF NOT EXISTS nft_owners (
           collection_address TEXT,
-          token_id TEXT,
+          token_ids TEXT,
           owner TEXT,
           contract_type TEXT
         )`,

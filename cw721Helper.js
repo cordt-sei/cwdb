@@ -261,6 +261,7 @@ export async function identifyContractTypes(restAddress, db) {
   }
 }
 
+// Fetch all minted tokens for specified NFT contracts
 export async function fetchAndStoreTokensForContracts(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
@@ -272,8 +273,8 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       return;
     }
 
-    // Get contracts that are CW721, CW404, or CW1155
-    const contractsResult = await dbAll("SELECT address, type FROM contracts WHERE type IN ('cw721', 'cw404', 'cw1155')");
+    // Fetch all contracts that are either CW404, CW721, or galxe_nft
+    const contractsResult = await dbAll("SELECT address, type FROM contracts WHERE type IN ('cw404', 'cw721_base', 'galxe_nft')");
     const startIndex = progress.last_processed ? contractsResult.findIndex(c => c.address === progress.last_processed) + 1 : 0;
 
     for (let i = startIndex; i < contractsResult.length; i++) {
@@ -281,7 +282,6 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       const tokenQueryPayload = { all_tokens: {} };
       let hasMore = true;
       let nextKey = null;
-      let batchData = [];
 
       while (hasMore) {
         const payload = {};
@@ -289,41 +289,66 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
           payload['pagination.key'] = nextKey;
         }
 
-        const tokens = await fetchPaginatedData(
-          `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64')}`,
-          null,
-          payload,
-          'tokens'
-        );
+        // Fetch tokens data for the contract using `all_tokens` query
+        try {
+          const tokens = await fetchPaginatedData(
+            `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64')}`,
+            payload,
+            'tokens'
+          );
 
-        if (tokens.length > 0) {
-          // Store token IDs for this contract
-          for (const token of tokens) {
-            batchData.push([contractAddress, token, contractType]);
+          if (tokens && tokens.length > 0) {
+            log(`Fetched ${tokens.length} tokens for contract ${contractAddress}`);
+
+            // Insert each token ID as a separate row in `contract_tokens` table
+            for (const tokenId of tokens) {
+              await dbRun(`INSERT OR REPLACE INTO contract_tokens (contract_address, token_id, contract_type) VALUES (?, ?, ?)`, [contractAddress, tokenId, contractType]);
+            }
+
+            // Update the `token_ids` column in the `contracts` table with all the fetched tokens
+            await dbRun(`UPDATE contracts SET token_ids = ? WHERE address = ?`, [tokens.join(','), contractAddress]);
+          } else {
+            log(`No tokens found for contract ${contractAddress}`);
+          }
+
+          nextKey = tokens.pagination?.next_key || null;
+          hasMore = tokens.length === config.paginationLimit && nextKey;
+
+        } catch (error) {
+          // Handle specific errors like 'out of gas' or 'Generic error'
+          if (error.response && error.response.data?.message?.includes('out of gas')) {
+            log(`Out of gas for contract ${contractAddress}. Updating type to 'pointer'.`);
+            await dbRun(`UPDATE contracts SET type = ? WHERE address = ?`, ['pointer', contractAddress]);
+            break;  // Skip this contract and move on
+          } else if (error.response && error.response.data?.message?.includes('Generic error')) {
+            log(`Generic error for contract ${contractAddress}. Updating type to 'pointer'.`);
+            await dbRun(`UPDATE contracts SET type = ? WHERE address = ?`, ['pointer', contractAddress]);
+            break;  // Skip this contract and move on
+          } else if (error.response && error.response.data?.message?.includes("cw404")) {
+            log(`CW404 contract detected. Relabeling contract ${contractAddress} as cw404_wrapper.`);
+            await dbRun(`UPDATE contracts SET type = ? WHERE address = ?`, ['cw404_wrapper', contractAddress]);
+            break;
+          } else {
+            log(`Error fetching tokens for contract ${contractAddress}: ${error.message}`);
+            throw error;  // Re-throw unknown errors
           }
         }
-
-        // Perform batch insert if data exists
-        if (batchData.length > 0) {
-          await batchInsert(dbRun, 'contract_tokens', ['contract_address', 'token_id', 'contract_type'], batchData);
-          batchData = []; // Clear batch data after insertion
-        }
-
-        nextKey = tokens.pagination?.next_key || null;
-        hasMore = tokens.length === config.paginationLimit && nextKey;
       }
 
+      // Update progress after processing each contract
       await updateProgress(db, 'fetchTokens', 0, contractAddress);
     }
 
-    log('Finished processing tokens for all CW721, CW404, and CW1155 contracts');
+    log('Finished processing tokens for all CW404, CW721, and galxe_nft contracts.');
     await updateProgress(db, 'fetchTokens', 1, null);
+
   } catch (error) {
     log(`Error in fetchAndStoreTokensForContracts: ${error.message}`);
     throw error;
   }
 }
 
+// Fetch owner wallet address for each token_id in each collection
 export async function fetchAndStoreTokenOwners(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
@@ -335,11 +360,13 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
       return;
     }
 
+    // Query contract_tokens table to get the contract address and token_id
     const contractTokensResult = await dbAll('SELECT contract_address, token_id, contract_type FROM contract_tokens');
 
     for (let i = 0; i < contractTokensResult.length; i++) {
       const { contract_address: contractAddress, token_id: tokenId, contract_type: contractType } = contractTokensResult[i];
 
+      // Prepare payload for querying the owner of the token
       const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
       const headers = { 'x-cosmos-block-height': config.blockHeight.toString() };
 
@@ -349,7 +376,11 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
         if (status === 200 && data && data.owner) {
           const owner = data.owner;
 
-          const insertOwnerSQL = `INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type) VALUES (?, ?, ?, ?)`;
+          // Insert owner details into the nft_owners table
+          const insertOwnerSQL = `
+            INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type)
+            VALUES (?, ?, ?, ?)
+          `;
           await dbRun(insertOwnerSQL, [contractAddress, tokenId, owner, contractType]);
 
           log(`Recorded ownership: Token ${tokenId} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
@@ -405,7 +436,7 @@ export async function fetchAndStorePointerData(pointerApi, db) {
     const contractAddresses = contractsResult.map(row => row.address);
 
     // Chunk addresses into smaller requests to avoid 413 error
-    const chunkSize = 50;
+    const chunkSize = 10;
     for (let i = 0; i < contractAddresses.length; i += chunkSize) {
       const chunk = contractAddresses.slice(i, i + chunkSize);
       const payload = { addresses: chunk };
@@ -414,9 +445,18 @@ export async function fetchAndStorePointerData(pointerApi, db) {
         const response = await axios.post(pointerApi, payload);
         if (response.status === 200 && response.data) {
           for (const entry of response.data) {
-            const { address, pointerAddress, pointeeAddress } = entry;
-            const insertSQL = `INSERT OR REPLACE INTO pointer_data (contract_address, pointer_address, pointee_address) VALUES (?, ?, ?)`;
-            await dbRun(insertSQL, [address, pointerAddress || null, pointeeAddress || null]);
+            const { address, pointerAddress, pointeeAddress, isBaseAsset, isPointer } = entry;
+            const insertSQL = `
+              INSERT OR REPLACE INTO pointer_data (contract_address, pointer_address, pointee_address, is_base_asset, is_pointer)
+              VALUES (?, ?, ?, ?, ?)
+            `;
+            await dbRun(insertSQL, [
+              address,
+              pointerAddress || null,
+              pointeeAddress || null,
+              isBaseAsset ? 1 : 0,   // Use 1 for true, 0 for false
+              isPointer ? 1 : 0      // Use 1 for true, 0 for false
+            ]);
             log(`Stored pointer data for address ${address}`);
           }
         }
