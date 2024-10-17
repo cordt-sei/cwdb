@@ -1,3 +1,5 @@
+// cw721Helper.js
+
 import { 
   fetchPaginatedData, 
   sendContractQuery, 
@@ -261,7 +263,7 @@ export async function identifyContractTypes(restAddress, db) {
   }
 }
 
-// Fetch all minted tokens for specified NFT contracts with concurrency and pagination
+// Updated fetchAndStoreTokensForContracts to track last_fetched_token
 export async function fetchAndStoreTokensForContracts(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
@@ -278,7 +280,7 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
     const startIndex = progress.last_processed ? contractsResult.findIndex(c => c.address === progress.last_processed) + 1 : 0;
 
     const fetchPromises = contractsResult.slice(startIndex).map(async ({ address: contractAddress, type: contractType }) => {
-      let startAfter = null; // Pagination parameter for the contract
+      let startAfter = progress.last_fetched_token || null; // Pagination parameter for the contract
       let tokensFetched = 0;
       let allTokensFetched = [];
 
@@ -288,7 +290,7 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
           // Construct the query payload with pagination
           const tokenQueryPayload = {
             all_tokens: {
-              limit: 100, // Fetch 100 tokens per batch
+              limit: config.paginationLimit, // Use the configured pagination limit
               ...(startAfter && { start_after: startAfter }) // Include start_after only if set
             }
           };
@@ -305,8 +307,11 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
             // Set the start_after parameter for the next batch
             startAfter = tokenIds[tokenIds.length - 1];
             
+            // Update progress after processing the batch
+            await updateProgress(db, 'fetchTokens', 0, contractAddress, startAfter);
+
             // If fewer tokens than the limit were fetched, it indicates the last page
-            if (tokenIds.length < 100) {
+            if (tokenIds.length < config.paginationLimit) {
               break;
             }
           } else {
@@ -332,14 +337,14 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       }
 
       // Update progress after processing each contract
-      await updateProgress(db, 'fetchTokens', 0, contractAddress);
+      await updateProgress(db, 'fetchTokens', 0, contractAddress, null);
     });
 
     // Execute all fetch promises in parallel
     await Promise.all(fetchPromises);
 
     log('Finished processing tokens for all relevant contracts.');
-    await updateProgress(db, 'fetchTokens', 1, null);
+    await updateProgress(db, 'fetchTokens', 1, null, null);
   } catch (error) {
     log(`Error in fetchAndStoreTokensForContracts: ${error.message}`);
     throw error;

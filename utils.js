@@ -1,4 +1,5 @@
 // utils.js
+
 import axios from 'axios';
 import WebSocket from 'ws';
 import fs from 'fs';
@@ -45,31 +46,55 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
 }
 
 // Helper function to fetch paginated data
-export async function fetchPaginatedData(url, key, limit = 100, offset = 0) {
+export async function fetchPaginatedData(url, key, limit = 100, paginationType = 'offset', paginationPayload = null) {
   let allData = [];
-  let currentOffset = offset;
+  let startAfter = null;
 
   while (true) {
-    const params = new URLSearchParams();
-    params.set('pagination.limit', limit.toString());
-    params.set('pagination.offset', currentOffset.toString());
-    const fullUrl = `${url}?${params.toString()}`;
-    log(`Fetching data from: ${fullUrl}`);
+    let requestUrl = url;
+    let payload;
+
+    if (paginationType === 'offset') {
+      // For URL-based pagination (offset)
+      const params = new URLSearchParams();
+      params.set('pagination.limit', limit.toString());
+      params.set('pagination.offset', allData.length.toString());
+      requestUrl = `${url}?${params.toString()}`;
+    } else if (paginationType === 'query') {
+      // For query-based pagination (custom payload)
+      payload = {
+        ...paginationPayload,
+        limit,
+        ...(startAfter && { start_after: startAfter })
+      };
+    }
+
+    log(`Fetching data from: ${requestUrl}`);
 
     try {
-      const response = await retryOperation(() => axios.get(fullUrl));
-      if (response.status === 200 && response.data) {
+      // Perform the request based on the pagination type
+      let response;
+      if (paginationType === 'offset') {
+        response = await retryOperation(() => axios.get(requestUrl));
+      } else if (paginationType === 'query') {
+        response = await retryOperation(() => axios.post(requestUrl, payload));
+      }
+
+      // Validate the response
+      if (response && response.status === 200 && response.data) {
         const dataBatch = response.data[key] || [];
         allData = allData.concat(dataBatch);
         log(`Fetched ${dataBatch.length} items in this batch.`);
 
-        // If the number of fetched items is less than the limit, we are done
+        // If the number of fetched items is less than the limit, it indicates the last page
         if (dataBatch.length < limit) break;
-        
-        // Increment the offset
-        currentOffset += limit;
+
+        // Update the startAfter for the next query batch
+        if (paginationType === 'query') {
+          startAfter = dataBatch[dataBatch.length - 1];
+        }
       } else {
-        log(`Unexpected response structure: ${JSON.stringify(response.data)}`);
+        log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`);
         break;
       }
     } catch (error) {
@@ -129,23 +154,25 @@ export async function batchInsert(dbRun, tableName, columns, data) {
   }
 }
 
+// Updated checkProgress to include last_fetched_token
 export async function checkProgress(db, step) {
   const dbGet = promisify(db.get).bind(db);
-  const sql = `SELECT completed, last_processed FROM indexer_progress WHERE step = ?`;
+  const sql = `SELECT completed, last_processed, last_fetched_token FROM indexer_progress WHERE step = ?`;
   try {
     const result = await dbGet(sql, [step]);
-    return result || { completed: 0, last_processed: null };
+    return result || { completed: 0, last_processed: null, last_fetched_token: null };
   } catch (error) {
     console.error(`Error checking progress for step ${step}:`, error);
-    return { completed: 0, last_processed: null };
+    return { completed: 0, last_processed: null, last_fetched_token: null };
   }
 }
 
-export async function updateProgress(db, step, completed = 1, lastProcessed = null) {
+// Updated updateProgress to handle last_fetched_token
+export async function updateProgress(db, step, completed = 1, lastProcessed = null, lastFetchedToken = null) {
   const dbRun = promisify(db.run).bind(db);
-  const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed) VALUES (?, ?, ?)`;
+  const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token) VALUES (?, ?, ?, ?)`;
   try {
-    await dbRun(sql, [step, completed, lastProcessed]);
+    await dbRun(sql, [step, completed, lastProcessed, lastFetchedToken]);
   } catch (error) {
     console.error(`Error updating progress for step ${step}:`, error);
     throw error;

@@ -28,7 +28,7 @@ if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
 const db = new sqlite3.Database('./data/indexer.db');
 initializeDatabase(db);
 
-// Create necessary tables if they don't exist
+// Create necessary tables if they don't exist, including adding missing columns if required
 function initializeDatabase(db) {
   return new Promise((resolve, reject) => {
     db.serialize(() => {
@@ -37,7 +37,8 @@ function initializeDatabase(db) {
         `CREATE TABLE IF NOT EXISTS indexer_progress (
           step TEXT PRIMARY KEY,
           completed INTEGER DEFAULT 0,
-          last_processed TEXT
+          last_processed TEXT,
+          last_fetched_token TEXT
         )`,
         `CREATE TABLE IF NOT EXISTS code_ids (
           code_id TEXT PRIMARY KEY,
@@ -83,6 +84,20 @@ function initializeDatabase(db) {
         db.run(statement, (err) => {
           if (err) {
             console.error('Error creating table:', err);
+            reject(err);
+          }
+        });
+      });
+
+      // Alter table to add the new column if it does not exist
+      const alterTableStatements = [
+        `ALTER TABLE indexer_progress ADD COLUMN last_fetched_token TEXT`
+      ];
+
+      alterTableStatements.forEach(statement => {
+        db.run(statement, (err) => {
+          if (err && !err.message.includes('duplicate column name')) {
+            console.error('Error altering table:', err);
             reject(err);
           }
         });
