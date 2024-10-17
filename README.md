@@ -23,7 +23,7 @@ The main configuration is in `config.js`:
 
 ```javascript
 export const config = {
-  blockHeight: 94496767,
+  blockHeight: 94496767, // optional parameter to pass 'x-cosmos-block-height' in requests
   paginationLimit: 100,
   numWorkers: 4,
   restAddress: "http://loalhost:1317",
