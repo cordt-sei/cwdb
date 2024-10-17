@@ -48,10 +48,11 @@ The following tables are used in the SQLite database:
 
 ## Running the Indexer
 
-Operating is extremely simple. 
- - FComplete `config.js`
- - Install dependencies
- - Ru
+Operating is extremely simple.
+
+- Complete `config.js`
+- Install dependencies
+- Ru
 
    ```sh
    yarn install && yarn start
@@ -67,8 +68,8 @@ The `indexer_progress` table tracks the last processed contract and token during
 - Errors not warranting a retry (400 for example) will not be retried.
 - Errors during batch processing are logged, and the indexing process continues.
 
-## Contributing
+### Contributing
 
 Please submit issues a pull request for any bug fixes or enhancements.
 
-##### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api).
+#### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api)
