@@ -273,7 +273,6 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       return;
     }
 
-    // Fetch all contracts that are either CW404, CW721, or galxe_nft
     const contractsResult = await dbAll("SELECT address, type FROM contracts WHERE type IN ('cw404', 'cw721_base', 'galxe_nft')");
     const startIndex = progress.last_processed ? contractsResult.findIndex(c => c.address === progress.last_processed) + 1 : 0;
 
@@ -284,20 +283,24 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       let nextKey = null;
 
       while (hasMore) {
-        const payload = {};
+        const payload = {
+          'pagination.limit': config.paginationLimit
+        };
         if (nextKey) {
           payload['pagination.key'] = nextKey;
         }
 
         // Fetch tokens data for the contract using `all_tokens` query
         try {
-          const tokens = await fetchPaginatedData(
+          const response = await fetchPaginatedData(
             `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64')}`,
             payload,
             'tokens'
           );
 
-          if (tokens && tokens.length > 0) {
+          const tokens = response.tokens || [];
+
+          if (tokens.length > 0) {
             log(`Fetched ${tokens.length} tokens for contract ${contractAddress}`);
 
             // Insert each token ID as a separate row in `contract_tokens` table
@@ -311,7 +314,7 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
             log(`No tokens found for contract ${contractAddress}`);
           }
 
-          nextKey = tokens.pagination?.next_key || null;
+          nextKey = response.pagination?.next_key || null;
           hasMore = tokens.length === config.paginationLimit && nextKey;
 
         } catch (error) {
@@ -323,10 +326,6 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
           } else if (error.response && error.response.data?.message?.includes('Generic error')) {
             log(`Generic error for contract ${contractAddress}. Updating type to 'pointer'.`);
             await dbRun(`UPDATE contracts SET type = ? WHERE address = ?`, ['pointer', contractAddress]);
-            break;  // Skip this contract and move on
-          } else if (error.response && error.response.data?.message?.includes("cw404")) {
-            log(`CW404 contract detected. Relabeling contract ${contractAddress} as cw404_wrapper.`);
-            await dbRun(`UPDATE contracts SET type = ? WHERE address = ?`, ['cw404_wrapper', contractAddress]);
             break;
           } else {
             log(`Error fetching tokens for contract ${contractAddress}: ${error.message}`);
