@@ -37,44 +37,38 @@ export async function retryOperation(operation) {
 }
 
 // Helper function to fetch paginated data
-export async function fetchPaginatedData(url, payload, key, batchSize = 100) {
+export async function fetchPaginatedData(url, key, limit = 100, offset = 0) {
   let allData = [];
-  let nextKey = payload?.['pagination.key'] || null;
+  let currentOffset = offset;
 
-  do {
+  while (true) {
     const params = new URLSearchParams();
-    if (nextKey) {
-      params.set('pagination.key', nextKey);
-    }
-    params.set('pagination.limit', batchSize.toString());
-
+    params.set('pagination.limit', limit.toString());
+    params.set('pagination.offset', currentOffset.toString());
     const fullUrl = `${url}?${params.toString()}`;
     log(`Fetching data from: ${fullUrl}`);
-    const response = await retryOperation(() => axios.get(fullUrl));
 
-    if (response.status === 200 && response.data) {
-      log(`Full API response: ${JSON.stringify(response.data)}`);
-
-      // Correctly handle the tokens data extraction
-      let dataBatch = [];
-      if (response.data?.data?.[key]) {
-        dataBatch = response.data.data[key];  // Access 'tokens' under 'data'
-      }
-
-      if (dataBatch.length > 0) {
+    try {
+      const response = await retryOperation(() => axios.get(fullUrl));
+      if (response.status === 200 && response.data) {
+        const dataBatch = response.data[key] || [];
         allData = allData.concat(dataBatch);
         log(`Fetched ${dataBatch.length} items in this batch.`);
+
+        // If the number of fetched items is less than the limit, we are done
+        if (dataBatch.length < limit) break;
+        
+        // Increment the offset
+        currentOffset += limit;
       } else {
-        log('No items found in this batch.');
+        log(`Unexpected response structure: ${JSON.stringify(response.data)}`);
+        break;
       }
-
-      // Handle pagination if applicable
-      nextKey = response.data?.pagination?.next_key || null;
-    } else {
-      throw new Error(`Unexpected response: ${JSON.stringify(response.data)}`);
+    } catch (error) {
+      log(`Error fetching paginated data: ${error.message}`);
+      throw error;
     }
-
-  } while (nextKey);
+  }
 
   log(`Total data fetched: ${allData.length}`);
   return allData;
@@ -82,30 +76,26 @@ export async function fetchPaginatedData(url, payload, key, batchSize = 100) {
 
 // Helper function to send a smart contract query
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
-  // Ensure payload is valid
-  if (!payload || typeof payload !== 'object') {
-    log(`Invalid payload provided for contract ${contractAddress}`);
-    return null;
-  }
-
-  // Convert payload to base64
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
+  
+  log(`Querying contract at URL: ${url}`);
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
-
-    // Log the full response
-    log(`Full API response for ${contractAddress}, token ${payload.owner_of.token_id}: ${JSON.stringify(response.data)}`);
-    log(`Response status: ${response.status}, Type of status: ${typeof response.status}`);
-
-    // Return both data and status
-    return { data: response.data, status: response.status };
+    if (response.status === 200 && response.data) {
+      log(`Query successful: ${JSON.stringify(response.data)}`);
+      return { data: response.data, status: response.status };
+    } else {
+      log(`Unexpected response: ${JSON.stringify(response.data)}`);
+      return null;
+    }
   } catch (error) {
     log(`Error querying contract ${contractAddress}: ${error.message}`);
     return null;
   }
 }
+
 
 // batchInsert utility function
 export async function batchInsert(dbRun, tableName, columns, data) {
