@@ -107,27 +107,26 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
   return allData;
 }
 
-// Helper function to send a smart contract query
+// contract query function
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
   
-  log(`Querying contract at URL: ${url}`);
+  log(`Querying contract at URL: ${url} with payload: ${JSON.stringify(payload)}`);
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
     
     // Check for valid response
     if (response && response.status === 200 && response.data) {
-      log(`Query successful: ${JSON.stringify(response.data)}`);
+      log(`Query successful for contract ${contractAddress}: ${JSON.stringify(response.data)}`);
       return { data: response.data, status: response.status };
     } else {
-      // Handle cases where response does not contain expected data
-      log(`Unexpected response structure or status: ${response.status} - ${JSON.stringify(response.data)}`);
+      log(`Unexpected response structure or status for contract ${contractAddress}: ${response.status} - ${JSON.stringify(response.data)}`);
       return { error: 'Unexpected response format', status: response.status };
     }
   } catch (error) {
-    // Improve logging for different error types, including 400 errors
+    // Improved logging for error scenarios
     if (error.response) {
       log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`);
       return { error: error.response.data?.message || 'Request failed', status: error.response.status };
@@ -138,9 +137,13 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
   }
 }
 
-// batchInsert utility function
+
+// batchInsert with enhanced logging
 export async function batchInsert(dbRun, tableName, columns, data) {
-  if (data.length === 0) return;
+  if (data.length === 0) {
+    log(`No data to insert into ${tableName}. Skipping batch insert.`);
+    return;
+  }
 
   const placeholders = data.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
   const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES ${placeholders}`;
@@ -148,11 +151,13 @@ export async function batchInsert(dbRun, tableName, columns, data) {
 
   try {
     await dbRun(insertSQL, flatData);
+    log(`Successfully inserted ${data.length} rows into ${tableName}.`);
   } catch (error) {
     log(`Error performing batch insert into ${tableName}: ${error.message}`);
     throw error;
   }
 }
+
 
 // Updated checkProgress to include last_fetched_token
 export async function checkProgress(db, step) {
