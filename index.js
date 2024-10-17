@@ -9,7 +9,7 @@ import {
   fetchAndStoreTokenOwners, 
   fetchAndStorePointerData, 
   fetchAndStoreAssociatedWallets 
-} from './cw721Helper.js';
+} from './contractHelper.js';
 import { 
   setupWebSocket, 
   log, 

@@ -6,20 +6,38 @@ import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
 
-// Logging function to write to both console and log file
-export function log(message) {
-  console.log(message);
+// Updated logging function with levels and filtering
+export function log(message, level = 'INFO', logToFile = true) {
+  const logLevels = { 'ERROR': 0, 'INFO': 1, 'DEBUG': 2 };
+  const currentLogLevel = 'INFO'; // Set the desired log level here
   
-  const logDir = './logs';
-  const logFile = path.join(logDir, 'data_collection.log');
-
-  // Ensure the logs directory exists
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
+  // Skip logging if the message level is below the current log level
+  if (logLevels[level] > logLevels[currentLogLevel]) {
+    return;
+  }
+  
+  // Format the log message with the current timestamp and level
+  const timestamp = new Date().toISOString();
+  const formattedMessage = `[${timestamp}] [${level}] ${message}`;
+  
+  // Always log to the console if the level is ERROR, otherwise based on level
+  if (level === 'ERROR' || currentLogLevel === 'DEBUG') {
+    console.log(formattedMessage);
   }
 
-  // Append to the log file
-  fs.appendFileSync(logFile, message + '\n');
+  // Log to file if logToFile is true and level is not DEBUG
+  if (logToFile && level !== 'DEBUG') {
+    const logDir = './logs';
+    const logFile = path.join(logDir, 'data_collection.log');
+
+    // Ensure the logs directory exists
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+
+    // Append to the log file
+    fs.appendFileSync(logFile, formattedMessage + '\n');
+  }
 }
 
 // Retry function that avoids retrying on certain status codes like 400
@@ -30,15 +48,16 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
     } catch (error) {
       // Avoid retrying if the error status is 400 (bad request)
       if (error.response && error.response.status === 400) {
-        log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`);
+        log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`, 'ERROR');
         throw error;
       }
 
+      // Retry logging
       if (i < retries - 1) {
-        log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`);
+        log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`, 'INFO');
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
-        log(`Operation failed after ${retries} retries: ${error.message}`);
+        log(`Operation failed after ${retries} retries: ${error.message}`, 'ERROR');
         throw error;
       }
     }
@@ -49,6 +68,8 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
 export async function fetchPaginatedData(url, key, limit = 100, paginationType = 'offset', paginationPayload = null) {
   let allData = [];
   let startAfter = null;
+
+  log(`Starting paginated data fetch from: ${url}`, 'INFO');
 
   while (true) {
     let requestUrl = url;
@@ -69,8 +90,6 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
       };
     }
 
-    log(`Fetching data from: ${requestUrl}`);
-
     try {
       // Perform the request based on the pagination type
       let response;
@@ -84,7 +103,9 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
       if (response && response.status === 200 && response.data) {
         const dataBatch = response.data[key] || [];
         allData = allData.concat(dataBatch);
-        log(`Fetched ${dataBatch.length} items in this batch.`);
+
+        // Log batch completion
+        log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
 
         // If the number of fetched items is less than the limit, it indicates the last page
         if (dataBatch.length < limit) break;
@@ -94,16 +115,16 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
           startAfter = dataBatch[dataBatch.length - 1];
         }
       } else {
-        log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`);
+        log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`, 'ERROR');
         break;
       }
     } catch (error) {
-      log(`Error fetching paginated data: ${error.message}`);
+      log(`Error fetching paginated data: ${error.message}`, 'ERROR');
       throw error;
     }
   }
 
-  log(`Total data fetched: ${allData.length}`);
+  log(`Finished fetching data. Total fetched: ${allData.length}`, 'INFO');
   return allData;
 }
 
@@ -111,37 +132,36 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
-  
-  log(`Querying contract at URL: ${url} with payload: ${JSON.stringify(payload)}`);
+
+  log(`Querying contract ${contractAddress} with payload: ${JSON.stringify(payload)}`, 'INFO');
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
-    
+
     // Check for valid response
     if (response && response.status === 200 && response.data) {
-      log(`Query successful for contract ${contractAddress}: ${JSON.stringify(response.data)}`);
+      log(`Query successful for contract ${contractAddress}. Data length: ${JSON.stringify(response.data).length}`, 'INFO');
       return { data: response.data, status: response.status };
     } else {
-      log(`Unexpected response structure or status for contract ${contractAddress}: ${response.status} - ${JSON.stringify(response.data)}`);
+      log(`Unexpected response or status for contract ${contractAddress}: ${response.status}`, 'ERROR');
       return { error: 'Unexpected response format', status: response.status };
     }
   } catch (error) {
-    // Improved logging for error scenarios
+    // Log errors based on the type of failure
     if (error.response) {
-      log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`);
+      log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`, 'ERROR');
       return { error: error.response.data?.message || 'Request failed', status: error.response.status };
     } else {
-      log(`Error querying contract ${contractAddress}: ${error.message}`);
+      log(`Error querying contract ${contractAddress}: ${error.message}`, 'ERROR');
       return { error: error.message, status: 500 };
     }
   }
 }
 
-
 // batchInsert with enhanced logging
 export async function batchInsert(dbRun, tableName, columns, data) {
   if (data.length === 0) {
-    log(`No data to insert into ${tableName}. Skipping batch insert.`);
+    log(`No data to insert into ${tableName}. Skipping batch insert.`, 'INFO');
     return;
   }
 
@@ -151,13 +171,12 @@ export async function batchInsert(dbRun, tableName, columns, data) {
 
   try {
     await dbRun(insertSQL, flatData);
-    log(`Successfully inserted ${data.length} rows into ${tableName}.`);
+    log(`Successfully inserted ${data.length} rows into ${tableName}.`, 'INFO');
   } catch (error) {
-    log(`Error performing batch insert into ${tableName}: ${error.message}`);
+    log(`Error performing batch insert into ${tableName}: ${error.message}`, 'ERROR');
     throw error;
   }
 }
-
 
 // Updated checkProgress to include last_fetched_token
 export async function checkProgress(db, step) {
