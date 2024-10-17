@@ -29,7 +29,7 @@ export const config = {
   restAddress: "http://loalhost:1317",
   wsAddress: "ws://localhost:26657/websocket",
   evmRpcAddress: "http://localhost:8545",
-  pointerApi: "https://pointer.basementnode.ca", // *This is a custom endpoint
+  pointerApi: "https://pointer.basementnodes.ca", // *This is a custom endpoint
   timeout: 5000
 };
 ```
