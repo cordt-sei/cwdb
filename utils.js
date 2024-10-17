@@ -21,18 +21,26 @@ export function log(message) {
   fs.appendFileSync(logFile, message + '\n');
 }
 
-// Simple operation function without retry logic, throwing actual error response
-export async function retryOperation(operation) {
-  try {
-    return await operation();
-  } catch (error) {
-    // Log the full error details, including the response if available
-    if (error.response) {
-      log(`Operation failed with status ${error.response.status}: ${JSON.stringify(error.response.data)}`);
-    } else {
-      log(`Operation failed: ${error.message}`);
+// Retry function that avoids retrying on certain status codes like 400
+export async function retryOperation(operation, retries = 3, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      // Avoid retrying if the error status is 400 (bad request)
+      if (error.response && error.response.status === 400) {
+        log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`);
+        throw error;
+      }
+
+      if (i < retries - 1) {
+        log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        log(`Operation failed after ${retries} retries: ${error.message}`);
+        throw error;
+      }
     }
-    throw error;  // Throw the actual error to ensure the response is passed along
   }
 }
 
@@ -83,19 +91,27 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
 
   try {
     const response = await retryOperation(() => axios.get(url, { headers }));
-    if (response.status === 200 && response.data) {
+    
+    // Check for valid response
+    if (response && response.status === 200 && response.data) {
       log(`Query successful: ${JSON.stringify(response.data)}`);
       return { data: response.data, status: response.status };
     } else {
-      log(`Unexpected response: ${JSON.stringify(response.data)}`);
-      return null;
+      // Handle cases where response does not contain expected data
+      log(`Unexpected response structure or status: ${response.status} - ${JSON.stringify(response.data)}`);
+      return { error: 'Unexpected response format', status: response.status };
     }
   } catch (error) {
-    log(`Error querying contract ${contractAddress}: ${error.message}`);
-    return null;
+    // Improve logging for different error types, including 400 errors
+    if (error.response) {
+      log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`);
+      return { error: error.response.data?.message || 'Request failed', status: error.response.status };
+    } else {
+      log(`Error querying contract ${contractAddress}: ${error.message}`);
+      return { error: error.message, status: 500 };
+    }
   }
 }
-
 
 // batchInsert utility function
 export async function batchInsert(dbRun, tableName, columns, data) {

@@ -261,7 +261,7 @@ export async function identifyContractTypes(restAddress, db) {
   }
 }
 
-// Fetch all minted tokens for specified NFT contracts
+// Fetch all minted tokens for specified NFT contracts with concurrency and pagination
 export async function fetchAndStoreTokensForContracts(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
@@ -273,48 +273,70 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
       return;
     }
 
+    // Get the list of contracts to process
     const contractsResult = await dbAll("SELECT address, type FROM contracts WHERE type IN ('cw404', 'cw721_base', 'galxe_nft')");
     const startIndex = progress.last_processed ? contractsResult.findIndex(c => c.address === progress.last_processed) + 1 : 0;
 
-    for (let i = startIndex; i < contractsResult.length; i++) {
-      const { address: contractAddress, type: contractType } = contractsResult[i];
-      const tokenQueryPayload = { num_tokens: {} };
+    const fetchPromises = contractsResult.slice(startIndex).map(async ({ address: contractAddress, type: contractType }) => {
+      let startAfter = null; // Pagination parameter for the contract
+      let tokensFetched = 0;
+      let allTokensFetched = [];
 
       try {
-        // Query to get the total number of tokens for the contract
-        const { data, status } = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
-        if (status === 200 && data && data.data && data.data.count) {
-          const tokenCount = parseInt(data.data.count, 10);
-          log(`Total tokens for contract ${contractAddress}: ${tokenCount}`);
-
-          if (tokenCount > 0) {
-            const tokenIds = Array.from({ length: tokenCount }, (_, index) => index.toString());
-            
-            // Insert each token ID as a separate row in the contract_tokens table
-            for (const tokenId of tokenIds) {
-              await dbRun(
-                `INSERT OR REPLACE INTO contract_tokens (contract_address, token_id, contract_type) VALUES (?, ?, ?)`,
-                [contractAddress, tokenId, contractType]
-              );
+        // Fetch tokens in paginated batches
+        while (true) {
+          // Construct the query payload with pagination
+          const tokenQueryPayload = {
+            all_tokens: {
+              limit: 100, // Fetch 100 tokens per batch
+              ...(startAfter && { start_after: startAfter }) // Include start_after only if set
             }
+          };
 
-            // Update the tokens column in the contracts table with the range of token IDs
-            await dbRun(`UPDATE contracts SET token_ids = ? WHERE address = ?`, [tokenIds.join(','), contractAddress]);
-            log(`Stored token IDs for contract ${contractAddress}`);
+          // Query the contract for tokens
+          const { data, status } = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
+          if (status === 200 && data && data.data && data.data.tokens && data.data.tokens.length > 0) {
+            const tokenIds = data.data.tokens;
+            allTokensFetched = allTokensFetched.concat(tokenIds);
+
+            tokensFetched += tokenIds.length;
+            log(`Fetched ${tokensFetched} tokens for contract ${contractAddress}`);
+
+            // Set the start_after parameter for the next batch
+            startAfter = tokenIds[tokenIds.length - 1];
+            
+            // If fewer tokens than the limit were fetched, it indicates the last page
+            if (tokenIds.length < 100) {
+              break;
+            }
           } else {
-            log(`No tokens found for contract ${contractAddress}`);
+            // If no tokens are returned, we have finished fetching all tokens for this contract
+            log(`Finished fetching tokens for contract ${contractAddress}`);
+            break;
           }
-        } else {
-          log(`Failed to fetch num_tokens for contract ${contractAddress}`);
         }
+
+        // Insert all fetched tokens into the database
+        if (allTokensFetched.length > 0) {
+          const insertData = allTokensFetched.map(tokenId => [contractAddress, tokenId, contractType]);
+          await batchInsert(dbRun, 'contract_tokens', ['contract_address', 'token_id', 'contract_type'], insertData);
+          log(`Stored ${allTokensFetched.length} tokens for contract ${contractAddress}.`);
+        }
+
+        // Update the tokens column in the contracts table with the total tokens fetched
+        await dbRun(`UPDATE contracts SET token_count = ? WHERE address = ?`, [tokensFetched, contractAddress]);
+        log(`Updated token count for contract ${contractAddress}: ${tokensFetched}`);
+
       } catch (error) {
-        log(`Error fetching num_tokens for contract ${contractAddress}: ${error.message}`);
-        continue; // Skip to the next contract if an error occurs
+        log(`Error fetching tokens for contract ${contractAddress}: ${error.message}`);
       }
 
       // Update progress after processing each contract
       await updateProgress(db, 'fetchTokens', 0, contractAddress);
-    }
+    });
+
+    // Execute all fetch promises in parallel
+    await Promise.all(fetchPromises);
 
     log('Finished processing tokens for all relevant contracts.');
     await updateProgress(db, 'fetchTokens', 1, null);
@@ -332,18 +354,32 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
   try {
     const progress = await checkProgress(db, 'fetchTokenOwners');
     log('Checking progress for fetchTokenOwners...');
+    let lastProcessedContractAddress = progress.last_processed_contract_address || null;
+    let lastProcessedTokenId = progress.last_processed_token_id || null;
+
     if (progress.completed) {
       log('Skipping fetchAndStoreTokenOwners: Already completed');
       return;
     }
 
-    // Query contract_tokens table to get the contract address and token_id
-    log('Querying contract_tokens table...');
-    const contractTokensResult = await dbAll('SELECT contract_address, token_id, contract_type FROM contract_tokens');
-    log(`Fetched ${contractTokensResult.length} tokens from contract_tokens.`);
+// Query contract_tokens table to get the contract address and token_id, skipping already processed tokens
+log('Querying contract_tokens table...');
+let contractTokensQuery = 'SELECT contract_address, token_id, contract_type FROM contract_tokens';
+let params = [];
+
+if (lastProcessedContractAddress && lastProcessedTokenId) {
+  contractTokensQuery += ` WHERE (contract_address > ? OR (contract_address = ? AND token_id > ?))`;
+  params = [lastProcessedContractAddress, lastProcessedContractAddress, lastProcessedTokenId];
+}
+
+const contractTokensResult = await dbAll(contractTokensQuery, params);
+log(`Fetched ${contractTokensResult.length} tokens from contract_tokens.`);
+
 
     const batchSize = 50; // Set a batch size for concurrent requests
+    const progressUpdateInterval = 5; // Update progress every 5 batches
     let processed = 0;
+    const ownershipData = [];
 
     // Batch processing of token ownership queries
     for (let i = 0; i < contractTokensResult.length; i += batchSize) {
@@ -367,13 +403,8 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
             const owner = data.data.owner;
             log(`Owner for token ${tokenId} found: ${owner}`);
 
-            // Insert owner details into the nft_owners table
-            const insertOwnerSQL = `
-              INSERT OR REPLACE INTO nft_owners (collection_address, token_id, owner, contract_type)
-              VALUES (?, ?, ?, ?)
-            `;
-            await dbRun(insertOwnerSQL, [contractAddress, tokenId, owner, contractType]);
-            log(`Recorded ownership: Token ${tokenId} owned by ${owner} in ${contractType} contract ${contractAddress}.`);
+            // Add owner details to the batch insert data
+            ownershipData.push([contractAddress, tokenId, owner, contractType]);
           } else {
             log(`No valid owner found for contract ${contractAddress}, token ${tokenId}`);
           }
@@ -385,17 +416,28 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
       // Wait for all promises in the batch to complete
       await Promise.all(batchPromises);
 
-      // Update progress and log processed count
+      // Perform batch insert into nft_owners table
+      if (ownershipData.length > 0) {
+        await batchInsert(dbRun, 'nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], ownershipData);
+        ownershipData.length = 0; // Clear the batch after insert
+      }
+
+      // Update the processed count
       processed += batch.length;
       log(`Processed ${processed} tokens so far.`);
 
-      // Update the last processed token ID in progress tracking
+      // Update progress after every batch
       const lastToken = batch[batch.length - 1];
-      await updateProgress(db, 'fetchTokenOwners', 0, lastToken.contract_address);
+      await updateProgress(db, 'fetchTokenOwners', 0, lastToken.contract_address, lastToken.token_id);
+
+      // Update progress every `progressUpdateInterval` batches
+      if ((i / batchSize) % progressUpdateInterval === 0) {
+        log(`Updated progress after ${progressUpdateInterval} batches.`);
+      }
     }
 
     log('Finished processing token ownership for all contracts');
-    await updateProgress(db, 'fetchTokenOwners', 1, null);
+    await updateProgress(db, 'fetchTokenOwners', 1, null, null);
   } catch (error) {
     log(`Error in fetchAndStoreTokenOwners: ${error.message}`);
     throw error;
