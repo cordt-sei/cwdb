@@ -1,119 +1,74 @@
-# CWDB: CosmWasm Database Indexer
+# CosmWasm NFT Indexer
 
-This project is a comprehensive indexer for CosmWasm smart contracts on the Sei blockchain. It collects and stores contract information, token data, and real-time updates in a SQLite database.
+Simple indexer that queries cw contracts, specifically focusing on CW721, CW404, and other NFT contracts. Gathers contract information, token details, ownership, and related data to store in a local SQLite database.
 
 ## Features
 
-- Indexes CosmWasm smart contracts on the Sei blockchain
-- Detects and categorizes contract types (CW721, CW20, CW1155)
-- Queries and stores token information for CW721 contracts
-- Real-time updates through WebSocket connection
-- Efficient SQLite database storage
-- Modular structure for easy maintenance and extension
+- Fetches code IDs and associated contract addresses.
+- Identifies contract types for filtering and categorization.
+- Fetches tokens from NFT contracts (CW721, CW404, etc.) with paginated querying.
+- Tracks progress and resumes indexing from the last checkpoint if interrupted.
+- Supports batch insertion for database efficiency.
+- Provides optional real-time updates using WebSocket connections. [**WIP**]
 
 ## Prerequisites
 
-- Node.js (v14.x or later)
+- Node.js (version >= 14.x)
 - SQLite3
-
-## Installation
-
-1. **Clone the Repository**
-
-   ```bash
-   git clone <repository-url>
-   cd <repository-directory>
-   ```
-
-2. **Install Dependencies**
-
-   ```bash
-   yarn install
-   ```
-
-## Project Structure
-
-```shell
-cwdb/
-├── data/
-│   └── smart_contracts.db
-├── logs/
-│   ├── data_collection.log
-│   └── real_time_indexer.log
-├── sample_queries/
-│   ├── query_db.js
-│   └── query_top5.js
-├── cw721Helper.js
-├── index.js
-├── realtime_index.js
-├── package.json
-└── README.md
-```
-
-## Usage
-
-1. **Initialize and Run the Indexer**
-
-   Start the indexer to begin collecting data from the Sei blockchain:
-
-   ```bash
-   node index.js
-   ```
-
-   This script will:
-   - Create necessary tables in the SQLite database (`data/smart_contracts.db`).
-   - Fetch contract information from the Sei blockchain.
-   - Store the contract and related information in the database.
-
-2. **Run the Real-Time Indexer**
-
-   To keep the database updated with real-time data, run:
-
-   ```bash
-   node realtime_index.js
-   ```
-
-   This script:
-   - Connects to the Sei blockchain WebSocket.
-   - Subscribes to relevant events (`instantiate`).
-   - Updates the database with new data as events occur.
-   - Determines contract types for newly instantiated contracts.
-   - Queries and stores token information for CW721 contracts.
-
-3. **Query the Database**
-
-   To execute predefined queries and explore the collected data:
-
-   - Run `sample_queries/query_db.js` for general queries:
-
-     ```bash
-     node sample_queries/query_db.js
-     ```
-
-   - Run `sample_queries/query_top5.js` to get the top 5 most deployed contracts:
-
-     ```bash
-     node sample_queries/query_top5.js
-     ```
+- [Preferrably non-rate-limited] RPC endpoints.
 
 ## Configuration
 
-- **Database**: The SQLite database (`smart_contracts.db`) is located in the `data/` directory.
-- **WebSocket URL**: The WebSocket URL for Sei blockchain is set in `realtime_index.js` (`RPC_WEBSOCKET_URL`).
-- **Logging**: Logs are stored in the `logs/` directory:
-  - `real_time_indexer.log`: Logs for the real-time indexer
-  - `data_collection.log`: Logs for the initial data collection process
+The main configuration is in `config.js`:
 
-## Troubleshooting
+```javascript
+export const config = {
+  blockHeight: 94496767,
+  paginationLimit: 100,
+  numWorkers: 4,
+  restAddress: "http://loalhost:1317",
+  wsAddress: "ws://localhost:26657/websocket",
+  evmRpcAddress: "http://localhost:8545",
+  pointerApi: "https://pointer.basementnode.ca", // *This is a custom endpoint
+  timeout: 5000
+};
+```
 
-- **WebSocket Connection Issues**: Ensure a stable internet connection and verify the WebSocket URL.
-- **Database Access Errors**: Check if the database file is correctly created in the `data/` directory and is accessible. Ensure permissions are set correctly.
-- **Missing Dependencies**: Run `yarn install` to ensure all required packages are installed.
+## Database Schema
+
+The following tables are used in the SQLite database:
+
+- `indexer_progress`: Tracks progress for each indexing step.
+- `code_ids`: Stores code ID metadata.
+- `contracts`: Stores contract addresses and types.
+- `contract_tokens`: Stores token data for each contract.
+- `nft_owners`: Stores ownership details for each token.
+- `pointer_data`: Tracks data related to pointer contracts.
+- `wallet_associations`: Maps wallet addresses to their EVM counterparts.
+
+## Running the Indexer
+
+Operating is extremely simple. 
+ - FComplete `config.js`
+ - Install dependencies
+ - Ru
+
+   ```sh
+   yarn install && yarn start
+   ```
+
+## Progress Tracking
+
+The `indexer_progress` table tracks the last processed contract and token during each stage, allowing resuming after interruption without losing progress.
+
+## Error Handling
+
+- Failed operations are retried up to 3 times.
+- Errors not warranting a retry (400 for example) will not be retried.
+- Errors during batch processing are logged, and the indexing process continues.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Please submit issues a pull request for any bug fixes or enhancements.
 
-## License
-
-This project is licensed under the ISC License.
+##### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api).

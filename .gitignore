@@ -6,9 +6,12 @@ node_modules/
 
 # SQLite database files
 *.db
+*.journal
+*.db-journal
 
 # Environment files
 .env
+config.js
 
 # Other system files
 .DS_Store
