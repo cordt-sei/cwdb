@@ -26,7 +26,7 @@ if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
 
 // Initialize SQLite database
 const db = new sqlite3.Database('./data/indexer.db');
-initializeDatabase(db);
+await initializeDatabase(db);
 
 // Create necessary tables if they don't exist, including adding missing columns if required
 function initializeDatabase(db) {
@@ -83,8 +83,8 @@ function initializeDatabase(db) {
       createTableStatements.forEach(statement => {
         db.run(statement, (err) => {
           if (err) {
-            console.error('Error creating table:', err);
-            reject(err);
+            log(`Error creating table with statement "${statement}": ${err.message}`, 'ERROR');
+            reject(new Error(`Table creation failed: ${statement}`));
           }
         });
       });
@@ -97,8 +97,8 @@ function initializeDatabase(db) {
       alterTableStatements.forEach(statement => {
         db.run(statement, (err) => {
           if (err && !err.message.includes('duplicate column name')) {
-            console.error('Error altering table:', err);
-            reject(err);
+            log(`Error altering table with statement "${statement}": ${err.message}`, 'ERROR');
+            reject(new Error(`Table alteration failed: ${statement}`));
           }
         });
       });
@@ -106,120 +106,82 @@ function initializeDatabase(db) {
       // Check if the database is new by looking for any existing progress
       db.get("SELECT COUNT(*) as count FROM indexer_progress", (err, row) => {
         if (err) {
-          console.error('Error checking indexer_progress:', err);
-          reject(err);
+          log(`Error checking indexer_progress: ${err.message}`, 'ERROR');
+          reject(new Error('Failed to check indexer progress'));
           return;
         }
 
         if (row.count === 0) {
-          console.log('New database initialized. Progress table is empty.');
+          log('New database initialized. Progress table is empty.', 'INFO');
         } else {
-          console.log('Existing database detected. Progress table has entries.');
+          log('Existing database detected. Progress table has entries.', 'INFO');
         }
 
-        console.log('Database tables initialized successfully.');
+        log('Database tables initialized successfully.', 'INFO');
         resolve();
       });
     });
   });
 }
 
-// main function
+// Main function
 async function runIndexer() {
   try {
     await initializeDatabase(db);
-    
-    // Fetch and store all code IDs
-    let progress = await checkProgress(db, 'fetchCodeIds');
-    if (!progress.completed) {
-      await fetchAndStoreCodeIds(config.restAddress, db);
-      await updateProgress(db, 'fetchCodeIds', 1);
-    } else {
-      console.log('Skipping fetchCodeIds: Already completed');
+    log('Database initialized.', 'INFO');
+
+    // Define the steps to execute
+    const steps = [
+      { name: 'fetchCodeIds', action: () => fetchAndStoreCodeIds(config.restAddress, db) },
+      { name: 'fetchContracts', action: () => fetchAndStoreContractsByCode(config.restAddress, db) },
+      { name: 'fetchContractHistory', action: () => fetchAndStoreContractHistory(config.restAddress, db) },
+      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
+      { name: 'fetchTokens', action: () => fetchAndStoreTokensForContracts(config.restAddress, db) },
+      { name: 'fetchTokenOwners', action: () => fetchAndStoreTokenOwners(config.restAddress, db) },
+      { name: 'fetchPointerData', action: () => fetchAndStorePointerData(config.pointerApi, db) },
+      { name: 'fetchAssociatedWallets', action: () => fetchAndStoreAssociatedWallets(config.evmRpcAddress, db) }
+    ];
+
+    // Execute each step in sequence
+    for (const step of steps) {
+      const progress = await checkProgress(db, step.name);
+      if (!progress.completed) {
+        log(`Starting step: ${step.name}`, 'INFO');
+        try {
+          await step.action();
+          await updateProgress(db, step.name, 1);
+          log(`Completed step: ${step.name}`, 'INFO');
+        } catch (error) {
+          log(`Error during ${step.name}: ${error.message}`, 'ERROR');
+          throw error; // Re-throw to be caught by the outer try-catch
+        }
+      } else {
+        log(`Skipping ${step.name}: Already completed`, 'DEBUG');
+      }
     }
 
-    // Fetch and store contracts for all code IDs
-    progress = await checkProgress(db, 'fetchContracts');
-    if (!progress.completed) {
-      await fetchAndStoreContractsByCode(config.restAddress, db);
-      await updateProgress(db, 'fetchContracts', 1);
-    } else {
-      console.log('Skipping fetchContracts: Already completed');
-    }
-
-    // Fetch contract history
-    progress = await checkProgress(db, 'fetchContractHistory');
-    if (!progress.completed) {
-      await fetchAndStoreContractHistory(config.restAddress, db);
-      await updateProgress(db, 'fetchContractHistory', 1);
-    } else {
-      console.log('Skipping fetchContractHistory: Already completed');
-    }
-
-    // Identify contract types
-    progress = await checkProgress(db, 'identifyContractTypes');
-    if (!progress.completed) {
-      await identifyContractTypes(config.restAddress, db);
-      await updateProgress(db, 'identifyContractTypes', 1);
-    } else {
-      console.log('Skipping identifyContractTypes: Already completed');
-    }
-
-    // Fetch and store token IDs for CW721, CW404, and CW1155 contracts
-    progress = await checkProgress(db, 'fetchTokens');
-    if (!progress.completed) {
-      await fetchAndStoreTokensForContracts(config.restAddress, db);
-      await updateProgress(db, 'fetchTokens', 1);
-    } else {
-      console.log('Skipping fetchTokens: Already completed');
-    }
-
-    // Fetch and store token ownership details
-    progress = await checkProgress(db, 'fetchTokenOwners');
-    if (!progress.completed) {
-      await fetchAndStoreTokenOwners(config.restAddress, db);
-      await updateProgress(db, 'fetchTokenOwners', 1);
-    } else {
-      console.log('Skipping fetchTokenOwners: Already completed');
-    }
-
-    // Fetch and store pointer data
-    progress = await checkProgress(db, 'fetchPointerData');
-    if (!progress.completed) {
-      await fetchAndStorePointerData(config.pointerApi, db);
-      await updateProgress(db, 'fetchPointerData', 1);
-    } else {
-      console.log('Skipping fetchPointerData: Already completed');
-    }
-
-    // Fetch and store associated wallet addresses
-    progress = await checkProgress(db, 'fetchAssociatedWallets');
-    if (!progress.completed) {
-      await fetchAndStoreAssociatedWallets(config.evmRpcAddress, db);
-      await updateProgress(db, 'fetchAssociatedWallets', 1);
-    } else {
-      console.log('Skipping fetchAssociatedWallets: Already completed');
-    }
-
-    console.log('All indexing steps completed successfully.');
+    log('All indexing steps completed successfully.', 'INFO');
 
     // WebSocket monitoring mode
-    setupWebSocket(config.wsAddress, handleMessage, console.log);
+    setupWebSocket(config.wsAddress, handleMessage, log);
   } catch (error) {
-    console.error(`Error running indexer: ${error.message}`);
+    log(`Error running indexer: ${error.message}`, 'ERROR');
     if (error.stack) {
-      console.error(`Stack trace: ${error.stack}`);
+      log(`Stack trace: ${error.stack}`, 'DEBUG');
     }
   }
 }
 
 // WebSocket message handler for real-time updates (WIP)
 function handleMessage(message) {
-  log('Received message:', message);
-  // Handle new data entries from WebSocket
+  log(`Received WebSocket message: ${JSON.stringify(message)}`, 'DEBUG');
+  // Process the message
 }
 
 // Start the indexer
 runIndexer().catch(error => {
-  console.error('Failed to run indexer:', error);
+  log(`Failed to run indexer: ${error.message}`, 'ERROR');
+  if (error.stack) {
+    log(`Stack trace: ${error.stack}`, 'DEBUG');
+  }
 });
