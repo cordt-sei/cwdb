@@ -65,8 +65,10 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
 }
 
 // Helper function to fetch paginated data
-export async function fetchPaginatedData(url, key, limit = 100, paginationType = 'offset', paginationPayload = null) {
+export async function fetchPaginatedData(url, key, options = {}) {
+  const { limit = 100, paginationType = 'offset', paginationPayload = null, useNextKey = false } = options;
   let allData = [];
+  let nextKey = null;
   let startAfter = null;
 
   log(`Starting paginated data fetch from: ${url}`, 'INFO');
@@ -82,38 +84,39 @@ export async function fetchPaginatedData(url, key, limit = 100, paginationType =
       params.set('pagination.offset', allData.length.toString());
       requestUrl = `${url}?${params.toString()}`;
     } else if (paginationType === 'query') {
-      // For query-based pagination (custom payload)
+      // For query-based pagination
       payload = {
         ...paginationPayload,
-        limit,
-        ...(startAfter && { start_after: startAfter })
+        'pagination.limit': limit,
+        ...(useNextKey && nextKey ? { 'pagination.key': nextKey } : {}),
+        ...(!useNextKey && startAfter ? { start_after: startAfter } : {})
       };
     }
 
     try {
       // Perform the request based on the pagination type
-      let response;
-      if (paginationType === 'offset') {
-        response = await retryOperation(() => axios.get(requestUrl));
-      } else if (paginationType === 'query') {
-        response = await retryOperation(() => axios.post(requestUrl, payload));
-      }
+      const response = paginationType === 'offset'
+        ? await retryOperation(() => axios.get(requestUrl))
+        : await retryOperation(() => axios.get(requestUrl, { params: payload }));
 
       // Validate the response
       if (response && response.status === 200 && response.data) {
         const dataBatch = response.data[key] || [];
         allData = allData.concat(dataBatch);
 
-        // Log batch completion
         log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
 
-        // If the number of fetched items is less than the limit, it indicates the last page
-        if (dataBatch.length < limit) break;
-
-        // Update the startAfter for the next query batch
-        if (paginationType === 'query') {
-          startAfter = dataBatch[dataBatch.length - 1];
+        // Determine the nextKey or startAfter for the next query
+        if (useNextKey && response.data.pagination?.next_key) {
+          nextKey = response.data.pagination.next_key;
+        } else if (!useNextKey && dataBatch.length > 0) {
+          startAfter = dataBatch[dataBatch.length - 1].code_id || dataBatch[dataBatch.length - 1].id;
+        } else {
+          break; // No more pages to fetch
         }
+
+        // Stop if the number of fetched items is less than the limit
+        if (dataBatch.length < limit) break;
       } else {
         log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`, 'ERROR');
         break;

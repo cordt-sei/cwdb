@@ -26,111 +26,86 @@ if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
 
 // Initialize SQLite database
 const db = new sqlite3.Database('./data/indexer.db');
-await initializeDatabase(db);
 
-// Create necessary tables if they don't exist, including adding missing columns if required
-function initializeDatabase(db) {
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      // Create tables
-      const createTableStatements = [
-        `CREATE TABLE IF NOT EXISTS indexer_progress (
-          step TEXT PRIMARY KEY,
-          completed INTEGER DEFAULT 0,
-          last_processed TEXT,
-          last_fetched_token TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS code_ids (
-          code_id TEXT PRIMARY KEY,
-          creator TEXT,
-          data_hash TEXT,
-          instantiate_permission TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS contracts (
-          code_id TEXT,
-          address TEXT PRIMARY KEY,
-          type TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS contract_history (
-          contract_address TEXT,
-          operation TEXT,
-          code_id TEXT,
-          updated TEXT,
-          msg TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS contract_tokens (
-          contract_address TEXT PRIMARY KEY,
-          extra_data TEXT,
-          contract_type TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS nft_owners (
-          collection_address TEXT,
-          token_ids TEXT,
-          owner TEXT,
-          contract_type TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS pointer_data (
-          contract_address TEXT PRIMARY KEY,
-          pointer_address TEXT,
-          pointee_address TEXT
-        )`,
-        `CREATE TABLE IF NOT EXISTS wallet_associations (
-          wallet_address TEXT PRIMARY KEY,
-          evm_address TEXT
-        )`
-      ];
+// Create necessary tables if they don't exist
+async function initializeDatabase(db) {
+  const createTableStatements = [
+    `CREATE TABLE IF NOT EXISTS indexer_progress (
+      step TEXT PRIMARY KEY,
+      completed INTEGER DEFAULT 0,
+      last_processed TEXT,
+      last_fetched_token TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS code_ids (
+      code_id TEXT PRIMARY KEY,
+      creator TEXT,
+      data_hash TEXT,
+      instantiate_permission TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS contracts (
+      code_id TEXT,
+      address TEXT PRIMARY KEY,
+      type TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_history (
+      contract_address TEXT,
+      operation TEXT,
+      code_id TEXT,
+      updated TEXT,
+      msg TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_tokens (
+      contract_address TEXT,
+      token_id TEXT,
+      contract_type TEXT,
+      PRIMARY KEY (contract_address, token_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS nft_owners (
+      collection_address TEXT,
+      token_id TEXT,
+      owner TEXT,
+      contract_type TEXT,
+      PRIMARY KEY (collection_address, token_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS pointer_data (
+      contract_address TEXT PRIMARY KEY,
+      pointer_address TEXT,
+      pointee_address TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS wallet_associations (
+      wallet_address TEXT PRIMARY KEY,
+      evm_address TEXT
+    )`
+  ];
 
-      createTableStatements.forEach(statement => {
+  try {
+    for (const statement of createTableStatements) {
+      await new Promise((resolve, reject) => {
         db.run(statement, (err) => {
           if (err) {
-            log(`Error creating table with statement "${statement}": ${err.message}`, 'ERROR');
-            reject(new Error(`Table creation failed: ${statement}`));
+            log(`Error creating table: ${err.message}`, 'ERROR');
+            reject(new Error(`Failed to create table: ${statement}`));
+          } else {
+            log(`Table created/verified: ${statement}`, 'INFO');
+            resolve();
           }
         });
       });
-
-      // Alter table to add the new column if it does not exist
-      const alterTableStatements = [
-        `ALTER TABLE indexer_progress ADD COLUMN last_fetched_token TEXT`
-      ];
-
-      alterTableStatements.forEach(statement => {
-        db.run(statement, (err) => {
-          if (err && !err.message.includes('duplicate column name')) {
-            log(`Error altering table with statement "${statement}": ${err.message}`, 'ERROR');
-            reject(new Error(`Table alteration failed: ${statement}`));
-          }
-        });
-      });
-
-      // Check if the database is new by looking for any existing progress
-      db.get("SELECT COUNT(*) as count FROM indexer_progress", (err, row) => {
-        if (err) {
-          log(`Error checking indexer_progress: ${err.message}`, 'ERROR');
-          reject(new Error('Failed to check indexer progress'));
-          return;
-        }
-
-        if (row.count === 0) {
-          log('New database initialized. Progress table is empty.', 'INFO');
-        } else {
-          log('Existing database detected. Progress table has entries.', 'INFO');
-        }
-
-        log('Database tables initialized successfully.', 'INFO');
-        resolve();
-      });
-    });
-  });
+    }
+    log('All tables initialized successfully.', 'INFO');
+  } catch (error) {
+    log(`Failed during table initialization: ${error.message}`, 'ERROR');
+    throw error;
+  }
 }
 
-// Main function
+// Main function to run the indexer
 async function runIndexer() {
   try {
     await initializeDatabase(db);
-    log('Database initialized.', 'INFO');
+    log('Database initialized successfully.', 'INFO');
 
-    // Define the steps to execute
+    // Define the sequence of steps
     const steps = [
       { name: 'fetchCodeIds', action: () => fetchAndStoreCodeIds(config.restAddress, db) },
       { name: 'fetchContracts', action: () => fetchAndStoreContractsByCode(config.restAddress, db) },
@@ -142,9 +117,11 @@ async function runIndexer() {
       { name: 'fetchAssociatedWallets', action: () => fetchAndStoreAssociatedWallets(config.evmRpcAddress, db) }
     ];
 
-    // Execute each step in sequence
+    // Execute each step sequentially
     for (const step of steps) {
       const progress = await checkProgress(db, step.name);
+      log(`Progress for ${step.name}: completed=${progress.completed}`, 'DEBUG');
+    
       if (!progress.completed) {
         log(`Starting step: ${step.name}`, 'INFO');
         try {
@@ -152,35 +129,34 @@ async function runIndexer() {
           await updateProgress(db, step.name, 1);
           log(`Completed step: ${step.name}`, 'INFO');
         } catch (error) {
-          log(`Error during ${step.name}: ${error.message}`, 'ERROR');
-          throw error; // Re-throw to be caught by the outer try-catch
+          log(`Error during step "${step.name}": ${error.message}`, 'ERROR');
+          throw error; // Stop execution if any step fails
         }
       } else {
-        log(`Skipping ${step.name}: Already completed`, 'DEBUG');
+        log(`Skipping step: ${step.name} (already completed)`, 'DEBUG');
       }
     }
 
     log('All indexing steps completed successfully.', 'INFO');
 
-    // WebSocket monitoring mode
+    // WebSocket monitoring (if applicable)
     setupWebSocket(config.wsAddress, handleMessage, log);
   } catch (error) {
-    log(`Error running indexer: ${error.message}`, 'ERROR');
+    log(`Failed to run indexer: ${error.message}`, 'ERROR');
     if (error.stack) {
       log(`Stack trace: ${error.stack}`, 'DEBUG');
     }
   }
 }
 
-// WebSocket message handler for real-time updates (WIP)
+// WebSocket handler
 function handleMessage(message) {
-  log(`Received WebSocket message: ${JSON.stringify(message)}`, 'DEBUG');
-  // Process the message
+  log(`WebSocket message received: ${JSON.stringify(message)}`, 'DEBUG');
 }
 
 // Start the indexer
-runIndexer().catch(error => {
-  log(`Failed to run indexer: ${error.message}`, 'ERROR');
+runIndexer().catch((error) => {
+  log(`Failed to initialize and run the indexer: ${error.message}`, 'ERROR');
   if (error.stack) {
     log(`Stack trace: ${error.stack}`, 'DEBUG');
   }

@@ -25,49 +25,59 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
       return;
     }
 
-    let startAfter = progress.last_processed ? parseInt(progress.last_processed) : null;
+    let startAfter = progress.last_processed ? Buffer.from(progress.last_processed).toString('base64') : null;
     let allCodeInfos = [];
     let hasMore = true;
 
     while (hasMore) {
       const payload = {
         'pagination.reverse': false,
-        'pagination.limit': config.paginationLimit
+        'pagination.limit': config.paginationLimit,
+        ...(startAfter && { 'pagination.key': startAfter }),
       };
 
-      if (startAfter !== null) {
-        payload['pagination.key'] = Buffer.from(startAfter.toString()).toString('base64');
-      }
-
-      const codeInfos = await fetchPaginatedData(
+      // Fetch paginated data
+      const response = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code`,
-        null,
-        payload,
-        'code_infos'
+        'code_infos',
+        config.paginationLimit,
+        'query',
+        payload
       );
 
-      if (codeInfos.length === 0) {
+      // Check if there are no more items to fetch
+      if (!Array.isArray(response) || response.length === 0) {
         log('No more code IDs to fetch.', 'INFO');
         break;
       }
 
       // Prepare batch data for inserting code IDs
-      const batchData = codeInfos.map(({ code_id, creator }) => [code_id, creator]);
+      const batchData = response.map(({ code_id, creator, data_hash, instantiate_permission }) => [
+        code_id, 
+        creator, 
+        data_hash, 
+        JSON.stringify(instantiate_permission),
+      ]);
 
       // Perform batch insert
-      await batchInsert(dbRun, 'code_ids', ['code_id', 'creator'], batchData);
+      await batchInsert(dbRun, 'code_ids', ['code_id', 'creator', 'data_hash', 'instantiate_permission'], batchData);
       log(`Inserted ${batchData.length} code IDs into the database.`, 'INFO');
 
-      // Update progress
-      allCodeInfos = allCodeInfos.concat(codeInfos);
-      startAfter = parseInt(codeInfos[codeInfos.length - 1].code_id);
-      hasMore = codeInfos.length === config.paginationLimit;
+      // Update progress after processing the batch
+      allCodeInfos = allCodeInfos.concat(response);
+      startAfter = Buffer.from(response[response.length - 1].code_id).toString('base64');
+      hasMore = response.length === config.paginationLimit;
 
-      await updateProgress(db, 'fetchCodeIds', 0, startAfter);
+      await updateProgress(db, 'fetchCodeIds', 0, response[response.length - 1].code_id);
     }
 
-    log(`Total code IDs fetched and stored: ${allCodeInfos.length}`, 'INFO');
-    await updateProgress(db, 'fetchCodeIds', 1, null);
+    // Mark as completed if any code IDs were fetched
+    if (allCodeInfos.length > 0) {
+      log(`Total code IDs fetched and stored: ${allCodeInfos.length}`, 'INFO');
+      await updateProgress(db, 'fetchCodeIds', 1, null);
+    } else {
+      log('No code IDs were fetched, skipping completion update.', 'INFO');
+    }
   } catch (error) {
     log(`Error in fetchAndStoreCodeIds: ${error.message}`, 'ERROR');
     throw error;
@@ -96,9 +106,12 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
       // Fetch contracts associated with the code_id using pagination
       const contracts = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`,
-        null,
-        { 'pagination.limit': config.paginationLimit }, // Use config for pagination limit
-        'contracts'
+        'contracts', // Specify the key to extract from the response
+        {
+          limit: config.paginationLimit,
+          paginationType: 'query',
+          useNextKey: true
+        }
       );
 
       if (contracts.length > 0) {
