@@ -161,7 +161,7 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
   }
 }
 
-// batchInsert with enhanced logging
+// batchInsert with enhanced logging and duplicate handling
 export async function batchInsert(dbRun, tableName, columns, data) {
   if (data.length === 0) {
     log(`No data to insert into ${tableName}. Skipping batch insert.`, 'INFO');
@@ -174,7 +174,7 @@ export async function batchInsert(dbRun, tableName, columns, data) {
 
   try {
     await dbRun(insertSQL, flatData);
-    log(`Successfully inserted ${data.length} rows into ${tableName}.`, 'INFO');
+    log(`Successfully inserted or replaced ${data.length} rows into ${tableName}.`, 'INFO');
   } catch (error) {
     log(`Error performing batch insert into ${tableName}: ${error.message}`, 'ERROR');
     throw error;
