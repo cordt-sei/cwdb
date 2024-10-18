@@ -49,7 +49,7 @@ The following tables are used in the SQLite database:
 ## Running the Indexer
 
 Operating is extremely simple. 
- - FComplete `config.js`
+ - Complete `config.js`
  - Install dependencies
  - Run:
 
