@@ -51,7 +51,7 @@ The following tables are used in the SQLite database:
 Operating is extremely simple. 
  - FComplete `config.js`
  - Install dependencies
- - Ru
+ - Run:
 
    ```sh
    yarn install && yarn start
