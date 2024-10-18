@@ -23,13 +23,13 @@ The main configuration is in `config.js`:
 
 ```javascript
 export const config = {
-  blockHeight: 94496767,
+  blockHeight: 94496767, // optional parameter to pass 'x-cosmos-block-height' in requests
   paginationLimit: 100,
   numWorkers: 4,
   restAddress: "http://loalhost:1317",
   wsAddress: "ws://localhost:26657/websocket",
   evmRpcAddress: "http://localhost:8545",
-  pointerApi: "https://pointer.basementnode.ca", // *This is a custom endpoint
+  pointerApi: "https://pointer.basementnodes.ca", // *This is a custom endpoint
   timeout: 5000
 };
 ```
@@ -48,11 +48,10 @@ The following tables are used in the SQLite database:
 
 ## Running the Indexer
 
-Operating is extremely simple.
-
-- Complete `config.js`
-- Install dependencies
-- Ru
+Operating is extremely simple. 
+ - Complete `config.js`
+ - Install dependencies
+ - Run:
 
    ```sh
    yarn install && yarn start
@@ -68,8 +67,8 @@ The `indexer_progress` table tracks the last processed contract and token during
 - Errors not warranting a retry (400 for example) will not be retried.
 - Errors during batch processing are logged, and the indexing process continues.
 
-### Contributing
+## Contributing
 
 Please submit issues a pull request for any bug fixes or enhancements.
 
-#### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api)
+##### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api).
