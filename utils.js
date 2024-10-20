@@ -40,19 +40,19 @@ export function log(message, level = 'INFO', logToFile = true) {
   }
 }
 
-// Retry function that avoids retrying on certain status codes like 400
+// Retry function that handles 400 status gracefully
 export async function retryOperation(operation, retries = 3, delay = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
       return await operation();
     } catch (error) {
-      // Avoid retrying if the error status is 400 (bad request), as these are expected failures
+      // Skip retrying for 400 errors, as they are expected for some cases
       if (error.response && error.response.status === 400) {
-        log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`, 'ERROR');
-        break; // Do not retry for 400 errors
+        log(`Skipping retry for 400 error: ${error.response.data?.message || error.message}`, 'INFO');
+        return error.response; // Return the 400 response for further handling
       }
 
-      // Retry logging
+      // Retry for other types of errors
       if (i < retries - 1) {
         log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`, 'INFO');
         await new Promise(resolve => setTimeout(resolve, delay));
@@ -64,15 +64,15 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
   }
 }
 
-// Helper function to fetch paginated data with versatile error handling
+/// Helper function to fetch paginated data with versatile error handling
 export async function fetchPaginatedData(url, key, options = {}) {
   const {
     limit = 100,
     paginationType = 'offset',
     paginationPayload = null,
     useNextKey = false,
-    onError = null, // Optional custom error handler
-    fallbackKey = null // Optional fallback key for unexpected response structures
+    onError = null,
+    fallbackKey = null
   } = options;
 
   let allData = [];
@@ -104,34 +104,39 @@ export async function fetchPaginatedData(url, key, options = {}) {
         ? await retryOperation(() => axios.get(requestUrl))
         : await retryOperation(() => axios.get(requestUrl, { params: payload }));
 
+      if (response.status === 400) {
+        log(`Skipping processing due to expected 400 error.`, 'DEBUG');
+        if (onError) onError(response); // Trigger the custom error handler, if provided
+        return allData; // Return what has been collected so far
+      }
+
+      // Handle unexpected response
       if (!response || response.status !== 200 || !response.data) {
         log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`, 'ERROR');
-        if (onError) onError(response); // Call custom error handler if provided
+        if (onError) onError(response);
         break;
       }
 
-      // Check for the main data key, with optional fallback
       const dataKey = response.data[key] || (fallbackKey && response.data[fallbackKey]);
       const dataBatch = Array.isArray(dataKey) ? dataKey : [];
       allData = allData.concat(dataBatch);
 
       log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
 
-      // Determine pagination continuation
+      // Pagination continuation
       if (useNextKey && response.data.pagination?.next_key) {
         nextKey = response.data.pagination.next_key;
       } else if (!useNextKey && dataBatch.length > 0) {
         startAfter = dataBatch[dataBatch.length - 1]?.code_id || dataBatch[dataBatch.length - 1]?.id;
       } else {
-        break; // No more pages to fetch
+        break; // End if no more data
       }
 
-      // Stop if fetched items are fewer than the limit
       if (dataBatch.length < limit) break;
     } catch (error) {
       log(`Error fetching paginated data: ${error.message}`, 'ERROR');
-      if (onError) onError(error); // Call custom error handler if provided
-      throw error; // Re-throw the error for the caller to handle if needed
+      if (onError) onError(error);
+      throw error;
     }
   }
 
@@ -142,9 +147,9 @@ export async function fetchPaginatedData(url, key, options = {}) {
 // Contract query function with versatile error handling
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}, options = {}) {
   const {
-    fallbackKey = null, // Optional key for fallback data structure
-    onError = null, // Optional custom error handler
-    retryCount = 3 // Optional number of retries
+    fallbackKey = null,
+    onError = null,
+    retryCount = 3
   } = options;
 
   if (!payload || typeof payload !== 'object') {
@@ -161,7 +166,18 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
   try {
     const response = await retryOperation(() => axios.get(url, { headers }), retryCount);
 
-    // Check for a valid response structure
+    if (response.status === 400) {
+      const match = response.data?.message?.match(/Error parsing into type (\S+)::msg::QueryMsg/);
+      if (match) {
+        const contractType = match[1];
+        log(`Identified contract type from 400 error: ${contractType} for contract ${contractAddress}`, 'INFO');
+        return { data: { contractType }, status: 400 };
+      }
+      log(`400 error for contract ${contractAddress} did not contain recognizable type info`, 'DEBUG');
+      return { error: 'Type not found in 400 response', status: 400 };
+    }
+
+    // Handle successful response
     const data = response?.data || {};
     const result = fallbackKey && data[fallbackKey] ? data[fallbackKey] : data;
 
@@ -174,32 +190,36 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
       return { error: 'Unexpected response format', status: response.status };
     }
   } catch (error) {
-    if (error.response) {
-      log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`, 'ERROR');
-      if (onError) onError(error);
-      return { error: error.response.data?.message || 'Request failed', status: error.response.status };
-    } else {
-      log(`Error querying contract ${contractAddress}: ${error.message}`, 'ERROR');
-      if (onError) onError(error);
-      return { error: error.message, status: 500 };
-    }
+    log(`Error querying contract ${contractAddress}: ${error.message}`, 'ERROR');
+    if (onError) onError(error);
+    return { error: error.message, status: 500 };
   }
 }
 
-// batchInsert with enhanced logging and duplicate handling
+// batchInsert with enhanced logging and conflict handling
 export async function batchInsert(dbRun, tableName, columns, data) {
   if (data.length === 0) {
     log(`No data to insert into ${tableName}. Skipping batch insert.`, 'INFO');
     return;
   }
 
-  const placeholders = data.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
-  const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES ${placeholders}`;
+  const placeholders = columns.map(() => '?').join(', '); // for each row
+  const updateSet = columns
+    .map(column => `${column} = excluded.${column}`)
+    .join(', '); // setting update for each column
+
+  // Construct the SQL for inserting or updating on conflict
+  const insertSQL = `
+    INSERT INTO ${tableName} (${columns.join(', ')})
+    VALUES ${data.map(() => `(${placeholders})`).join(', ')}
+    ON CONFLICT(address) DO UPDATE SET ${updateSet}
+  `;
+
   const flatData = data.flat();
 
   try {
     await dbRun(insertSQL, flatData);
-    log(`Successfully inserted or replaced ${data.length} rows into ${tableName}.`, 'INFO');
+    log(`Successfully inserted or updated ${data.length} rows into ${tableName}.`, 'INFO');
   } catch (error) {
     log(`Error performing batch insert into ${tableName}: ${error.message}`, 'ERROR');
     throw error;
