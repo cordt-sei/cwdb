@@ -46,10 +46,10 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
     try {
       return await operation();
     } catch (error) {
-      // Avoid retrying if the error status is 400 (bad request)
+      // Avoid retrying if the error status is 400 (bad request), as these are expected failures
       if (error.response && error.response.status === 400) {
         log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`, 'ERROR');
-        throw error;
+        break; // Do not retry for 400 errors
       }
 
       // Retry logging
@@ -64,9 +64,17 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
   }
 }
 
-// Helper function to fetch paginated data
+// Helper function to fetch paginated data with versatile error handling
 export async function fetchPaginatedData(url, key, options = {}) {
-  const { limit = 100, paginationType = 'offset', paginationPayload = null, useNextKey = false } = options;
+  const {
+    limit = 100,
+    paginationType = 'offset',
+    paginationPayload = null,
+    useNextKey = false,
+    onError = null, // Optional custom error handler
+    fallbackKey = null // Optional fallback key for unexpected response structures
+  } = options;
+
   let allData = [];
   let nextKey = null;
   let startAfter = null;
@@ -78,13 +86,11 @@ export async function fetchPaginatedData(url, key, options = {}) {
     let payload;
 
     if (paginationType === 'offset') {
-      // For URL-based pagination (offset)
       const params = new URLSearchParams();
       params.set('pagination.limit', limit.toString());
       params.set('pagination.offset', allData.length.toString());
       requestUrl = `${url}?${params.toString()}`;
     } else if (paginationType === 'query') {
-      // For query-based pagination
       payload = {
         ...paginationPayload,
         'pagination.limit': limit,
@@ -94,36 +100,38 @@ export async function fetchPaginatedData(url, key, options = {}) {
     }
 
     try {
-      // Perform the request based on the pagination type
       const response = paginationType === 'offset'
         ? await retryOperation(() => axios.get(requestUrl))
         : await retryOperation(() => axios.get(requestUrl, { params: payload }));
 
-      // Validate the response
-      if (response && response.status === 200 && response.data) {
-        const dataBatch = response.data[key] || [];
-        allData = allData.concat(dataBatch);
-
-        log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
-
-        // Determine the nextKey or startAfter for the next query
-        if (useNextKey && response.data.pagination?.next_key) {
-          nextKey = response.data.pagination.next_key;
-        } else if (!useNextKey && dataBatch.length > 0) {
-          startAfter = dataBatch[dataBatch.length - 1].code_id || dataBatch[dataBatch.length - 1].id;
-        } else {
-          break; // No more pages to fetch
-        }
-
-        // Stop if the number of fetched items is less than the limit
-        if (dataBatch.length < limit) break;
-      } else {
+      if (!response || response.status !== 200 || !response.data) {
         log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`, 'ERROR');
+        if (onError) onError(response); // Call custom error handler if provided
         break;
       }
+
+      // Check for the main data key, with optional fallback
+      const dataKey = response.data[key] || (fallbackKey && response.data[fallbackKey]);
+      const dataBatch = Array.isArray(dataKey) ? dataKey : [];
+      allData = allData.concat(dataBatch);
+
+      log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
+
+      // Determine pagination continuation
+      if (useNextKey && response.data.pagination?.next_key) {
+        nextKey = response.data.pagination.next_key;
+      } else if (!useNextKey && dataBatch.length > 0) {
+        startAfter = dataBatch[dataBatch.length - 1]?.code_id || dataBatch[dataBatch.length - 1]?.id;
+      } else {
+        break; // No more pages to fetch
+      }
+
+      // Stop if fetched items are fewer than the limit
+      if (dataBatch.length < limit) break;
     } catch (error) {
       log(`Error fetching paginated data: ${error.message}`, 'ERROR');
-      throw error;
+      if (onError) onError(error); // Call custom error handler if provided
+      throw error; // Re-throw the error for the caller to handle if needed
     }
   }
 
@@ -131,31 +139,48 @@ export async function fetchPaginatedData(url, key, options = {}) {
   return allData;
 }
 
-// contract query function
-export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
+// Contract query function with versatile error handling
+export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}, options = {}) {
+  const {
+    fallbackKey = null, // Optional key for fallback data structure
+    onError = null, // Optional custom error handler
+    retryCount = 3 // Optional number of retries
+  } = options;
+
+  if (!payload || typeof payload !== 'object') {
+    log(`Invalid payload for contract ${contractAddress}: ${JSON.stringify(payload)}`, 'ERROR');
+    if (onError) onError(new Error('Invalid payload'));
+    return { error: 'Invalid payload', status: 400 };
+  }
+
   const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
   const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
 
   log(`Querying contract ${contractAddress} with payload: ${JSON.stringify(payload)}`, 'INFO');
 
   try {
-    const response = await retryOperation(() => axios.get(url, { headers }));
+    const response = await retryOperation(() => axios.get(url, { headers }), retryCount);
 
-    // Check for valid response
-    if (response && response.status === 200 && response.data) {
-      log(`Query successful for contract ${contractAddress}. Data length: ${JSON.stringify(response.data).length}`, 'INFO');
-      return { data: response.data, status: response.status };
+    // Check for a valid response structure
+    const data = response?.data || {};
+    const result = fallbackKey && data[fallbackKey] ? data[fallbackKey] : data;
+
+    if (response.status === 200 && typeof result === 'object') {
+      log(`Query successful for contract ${contractAddress}. Data length: ${JSON.stringify(result).length}`, 'INFO');
+      return { data: result, status: response.status };
     } else {
       log(`Unexpected response or status for contract ${contractAddress}: ${response.status}`, 'ERROR');
+      if (onError) onError(new Error('Unexpected response format'));
       return { error: 'Unexpected response format', status: response.status };
     }
   } catch (error) {
-    // Log errors based on the type of failure
     if (error.response) {
       log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`, 'ERROR');
+      if (onError) onError(error);
       return { error: error.response.data?.message || 'Request failed', status: error.response.status };
     } else {
       log(`Error querying contract ${contractAddress}: ${error.message}`, 'ERROR');
+      if (onError) onError(error);
       return { error: error.message, status: 500 };
     }
   }

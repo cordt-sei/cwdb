@@ -2,7 +2,8 @@
 
 import { 
   fetchAndStoreCodeIds, 
-  fetchAndStoreContractsByCode, 
+  fetchAndStoreContractAddressesByCode,
+  fetchAndStoreContractMetadata,
   fetchAndStoreContractHistory, 
   identifyContractTypes, 
   fetchAndStoreTokensForContracts, 
@@ -74,7 +75,10 @@ async function initializeDatabase(db) {
     `CREATE TABLE IF NOT EXISTS pointer_data (
       contract_address TEXT PRIMARY KEY,
       pointer_address TEXT,
-      pointee_address TEXT
+      pointee_address TEXT,
+      is_base_asset INTEGER,
+      is_pointer INTEGER,
+      pointer_type TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS wallet_associations (
       wallet_address TEXT PRIMARY KEY,
@@ -112,7 +116,8 @@ async function runIndexer() {
     // Define the sequence of steps with retries
     const steps = [
       { name: 'fetchCodeIds', action: () => fetchAndStoreCodeIds(config.restAddress, db) },
-      { name: 'fetchContracts', action: () => fetchAndStoreContractsByCode(config.restAddress, db) },
+      { name: 'fetchContractAddressesByCode', action: () => fetchAndStoreContractAddressesByCode(config.restAddress, db) },
+      { name: 'fetchContractMetadata', action: () => fetchAndStoreContractMetadata(config.restAddress, db) },
       { name: 'fetchContractHistory', action: () => fetchAndStoreContractHistory(config.restAddress, db) },
       { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
       { name: 'fetchTokens', action: () => fetchAndStoreTokensForContracts(config.restAddress, db) },
@@ -176,7 +181,6 @@ async function runIndexer() {
     }
   }
 }
-
 
 // WebSocket handler
 function handleMessage(message) {

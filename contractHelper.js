@@ -14,9 +14,10 @@ import { Buffer } from 'buffer';
 import axios from 'axios';
 import { config } from './config.js';
 
-// Fetch all code IDs and store them in the database with progress tracking
+// Fetch all code IDs and store them in the database using batch insert and parallel processing
 export async function fetchAndStoreCodeIds(restAddress, db) {
   const dbRun = promisify(db.run).bind(db);
+  const batchSize = 3; // Number of parallel requests
 
   try {
     const progress = await checkProgress(db, 'fetchCodeIds');
@@ -52,15 +53,29 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
         break;
       }
 
-      const batchData = response.map(({ code_id, creator, data_hash, instantiate_permission }) => [
-        code_id, 
-        creator, 
-        data_hash, 
-        JSON.stringify(instantiate_permission)
-      ]);
+      // Split response into smaller batches for parallel processing
+      for (let i = 0; i < response.length; i += batchSize) {
+        const batch = response.slice(i, i + batchSize);
 
-      await batchInsert(dbRun, 'code_ids', ['code_id', 'creator', 'data_hash', 'instantiate_permission'], batchData);
-      log(`Inserted ${batchData.length} code IDs into the database.`, 'INFO');
+        // Prepare batch data for inserting code IDs in parallel
+        const insertPromises = batch.map(async ({ code_id, creator, data_hash, instantiate_permission }) => {
+          try {
+            const batchData = [
+              code_id, 
+              creator, 
+              data_hash, 
+              JSON.stringify(instantiate_permission)
+            ];
+            await batchInsert(dbRun, 'code_ids', ['code_id', 'creator', 'data_hash', 'instantiate_permission'], [batchData]);
+            log(`Inserted code ID: ${code_id}`, 'INFO');
+          } catch (error) {
+            log(`Failed to insert code ID ${code_id}: ${error.message}`, 'ERROR');
+          }
+        });
+
+        // Wait for all inserts in the batch to complete
+        await Promise.all(insertPromises);
+      }
 
       allCodeInfos = allCodeInfos.concat(response);
       startAfter = Buffer.from(response[response.length - 1].code_id).toString('base64');
@@ -81,14 +96,15 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
   }
 }
 
-// Fetch contracts by code and store them in the database using batch insert with improved tracking
-export async function fetchAndStoreContractsByCode(restAddress, db) {
+// Fetch contract addresses by code and store them in the database
+export async function fetchAndStoreContractAddressesByCode(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
+  const dbRun = promisify(db.run).bind(db);
 
   try {
-    const progress = await checkProgress(db, 'fetchContracts');
+    const progress = await checkProgress(db, 'fetchContractsByCode');
     if (progress.completed) {
-      log('Skipping fetchAndStoreContractsByCode: Already completed', 'INFO');
+      log('Skipping fetchAndStoreContractAddressesByCode: Already completed', 'INFO');
       return;
     }
 
@@ -100,6 +116,7 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
     for (let i = startIndex; i < codeIds.length; i++) {
       const code_id = codeIds[i];
 
+      // Fetch contracts associated with the code_id using pagination
       const contracts = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`,
         'contracts',
@@ -111,37 +128,96 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
       );
 
       if (contracts.length > 0) {
-        log(`Fetched ${contracts.length} contracts for code_id: ${code_id}`, 'INFO');
+        log(`Fetched ${contracts.length} contract addresses for code_id: ${code_id}`, 'INFO');
 
-        // Fetch additional metadata for each contract
-        const batchData = [];
-        for (const contractAddress of contracts) {
-          const contractInfo = await sendContractQuery(`${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`, null);
-          const { creator, admin, label } = contractInfo.contract_info || {};
+        // Prepare data for batch insertion
+        const batchData = contracts.map(contractAddress => [code_id, contractAddress, null]);
 
-          batchData.push([code_id, contractAddress, null, creator, admin, label]);
-        }
-
-        await batchInsert(db.run.bind(db), 'contracts', ['code_id', 'address', 'type', 'creator', 'admin', 'label'], batchData);
-        log(`Batch inserted ${batchData.length} contracts for code_id: ${code_id}`, 'INFO');
+        // Perform batch insert of contract addresses
+        await batchInsert(dbRun, 'contracts', ['code_id', 'address', 'type'], batchData);
+        log(`Batch inserted ${batchData.length} contract addresses for code_id: ${code_id}`, 'INFO');
       } else {
-        log(`No contracts found for code_id: ${code_id}`, 'INFO');
+        log(`No contract addresses found for code_id: ${code_id}`, 'INFO');
       }
 
-      await updateProgress(db, 'fetchContracts', 0, code_id);
+      // Update progress after processing each code_id
+      await updateProgress(db, 'fetchContractsByCode', 0, code_id);
     }
 
-    log(`Finished processing contracts for all ${codeIds.length} code IDs`, 'INFO');
-    await updateProgress(db, 'fetchContracts', 1, null);
+    log(`Finished fetching and storing contract addresses for all ${codeIds.length} code IDs`, 'INFO');
+    await updateProgress(db, 'fetchContractsByCode', 1, null);
   } catch (error) {
-    log(`Error in fetchAndStoreContractsByCode: ${error.message}`, 'ERROR');
+    log(`Error in fetchAndStoreContractAddressesByCode: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Fetch and store contract history per contract
+// Fetch and store metadata for each contract address
+export async function fetchAndStoreContractMetadata(restAddress, db) {
+  const dbAll = promisify(db.all).bind(db);
+  const dbRun = promisify(db.run).bind(db);
+  const batchSize = 5; // Set batch size for parallel processing
+
+  try {
+    const progress = await checkProgress(db, 'fetchContractMetadata');
+    if (progress.completed) {
+      log('Skipping fetchAndStoreContractMetadata: Already completed', 'INFO');
+      return;
+    }
+
+    const contractsResult = await dbAll('SELECT address FROM contracts');
+    const contractAddresses = contractsResult.map(row => row.address);
+    const startIndex = progress.last_processed ? contractAddresses.indexOf(progress.last_processed) + 1 : 0;
+
+    for (let i = startIndex; i < contractAddresses.length; i += batchSize) {
+      const batch = contractAddresses.slice(i, i + batchSize);
+
+      // Fetch metadata for each contract in parallel
+      const fetchPromises = batch.map(async contractAddress => {
+        const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`;
+        try {
+          const response = await retryOperation(() => axios.get(url));
+          if (response.status === 200 && response.data?.contract_info) {
+            const { code_id, creator, admin, label } = response.data.contract_info;
+            return [contractAddress, code_id, creator, admin, label];
+          } else {
+            log(`No contract info returned for ${contractAddress}`, 'INFO');
+            return null; // Skip if no data is found
+          }
+        } catch (error) {
+          log(`Failed to fetch contract info for ${contractAddress}: ${error.message}`, 'ERROR');
+          return null; // Skip this contract if it fails
+        }
+      });
+
+      // Wait for all promises in the batch to resolve
+      const results = await Promise.all(fetchPromises);
+      const validResults = results.filter(result => result !== null);
+
+      // Batch insert the collected data
+      if (validResults.length > 0) {
+        await batchInsert(dbRun, 'contracts', ['address', 'code_id', 'creator', 'admin', 'label'], validResults);
+        log(`Batch inserted ${validResults.length} contracts metadata`, 'INFO');
+      }
+
+      // Update progress after processing the batch
+      const lastContractAddress = batch[batch.length - 1];
+      await updateProgress(db, 'fetchContractMetadata', 0, lastContractAddress);
+    }
+
+    log(`Finished processing metadata for all ${contractAddresses.length} contracts`, 'INFO');
+    await updateProgress(db, 'fetchContractMetadata', 1, null);
+  } catch (error) {
+    log(`Error in fetchAndStoreContractMetadata: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+// Fetch and store contract history per contract with parallel processing and batch insertions
 export async function fetchAndStoreContractHistory(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
+  const dbRun = promisify(db.run).bind(db);
+  const batchSize = 10; // Number of contracts to process in parallel
 
   try {
     const progress = await checkProgress(db, 'fetchContractHistory');
@@ -154,39 +230,50 @@ export async function fetchAndStoreContractHistory(restAddress, db) {
     const contractAddresses = contractsResult.map(row => row.address);
     const startIndex = progress.last_processed ? contractAddresses.indexOf(progress.last_processed) + 1 : 0;
 
-    for (let i = startIndex; i < contractAddresses.length; i++) {
-      const address = contractAddresses[i];
-      let batchData = [];
+    for (let i = startIndex; i < contractAddresses.length; i += batchSize) {
+      const batch = contractAddresses.slice(i, i + batchSize);
+      const historyPromises = batch.map(async (address) => {
+        try {
+          // Fetch history entries using paginated requests
+          const historyEntries = await fetchPaginatedData(
+            `${restAddress}/cosmwasm/wasm/v1/contract/${address}/history`,
+            'entries',
+            {
+              limit: config.paginationLimit,
+              paginationType: 'query',
+              useNextKey: true
+            }
+          );
 
-      // Fetch history entries using paginated requests
-      const historyEntries = await fetchPaginatedData(
-        `${restAddress}/cosmwasm/wasm/v1/contract/${address}/history`,
-        null,
-        { 'pagination.limit': config.paginationLimit },
-        'entries'
-      );
+          if (historyEntries.length > 0) {
+            log(`Fetched ${historyEntries.length} history entries for contract: ${address}`, 'INFO');
 
-      if (historyEntries.length > 0) {
-        log(`Fetched ${historyEntries.length} history entries for contract: ${address}`, 'INFO');
+            // Prepare data for batch insertion
+            const batchData = historyEntries.map(({ operation, code_id, updated, msg }) => [
+              address,
+              operation,
+              code_id,
+              updated || null,
+              JSON.stringify(msg)
+            ]);
 
-        // Prepare data for batch insertion
-        batchData = historyEntries.map(({ operation, code_id, updated, msg }) => [
-          address,
-          operation,
-          code_id,
-          updated || null,
-          JSON.stringify(msg)
-        ]);
+            // Perform batch insert
+            await batchInsert(dbRun, 'contract_history', ['contract_address', 'operation', 'code_id', 'updated', 'msg'], batchData);
+            log(`Inserted ${batchData.length} history records for contract: ${address}`, 'INFO');
+          } else {
+            log(`No history entries found for contract: ${address}`, 'INFO');
+          }
 
-        // Perform batch insert
-        await batchInsert(db.run.bind(db), 'contract_history', ['contract_address', 'operation', 'code_id', 'updated', 'msg'], batchData);
-        log(`Inserted ${batchData.length} history records for contract: ${address}`, 'INFO');
-      } else {
-        log(`No history entries found for contract: ${address}`, 'INFO');
-      }
+          // Update progress after processing this contract
+          await updateProgress(db, 'fetchContractHistory', 0, address);
+        } catch (error) {
+          log(`Error fetching history for contract ${address}: ${error.message}`, 'ERROR');
+        }
+      });
 
-      // Update progress after processing each contract
-      await updateProgress(db, 'fetchContractHistory', 0, address);
+      // Execute all promises in the batch
+      await Promise.all(historyPromises);
+      log(`Processed a batch of ${batch.length} contracts`, 'INFO');
     }
 
     log(`Finished processing history for all ${contractAddresses.length} contracts`, 'INFO');
@@ -197,12 +284,12 @@ export async function fetchAndStoreContractHistory(restAddress, db) {
   }
 }
 
-// Identify contract types and store them in the database using batch processing
+// Identify contract types and store them in the database using parallel processing and batch inserts
 export async function identifyContractTypes(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
-
-  const batchSize = 50; // Set a batch size for DB writes
-  let batchData = []; // Hold the data to be written in a batch
+  const dbRun = promisify(db.run).bind(db);
+  const batchSize = 50; // Number of contracts to process in each batch
+  const parallelRequests = 10; // Number of parallel requests
 
   try {
     const progress = await checkProgress(db, 'identifyContractTypes');
@@ -215,39 +302,49 @@ export async function identifyContractTypes(restAddress, db) {
     const contracts = contractsResult.map(row => row.address);
     const startIndex = progress.last_processed ? contracts.indexOf(progress.last_processed) + 1 : 0;
 
-    for (let i = startIndex; i < contracts.length; i++) {
-      const contractAddress = contracts[i];
+    let batchData = [];
 
-      // Determine the contract type using a test payload
-      const testPayload = { "a": "b" }; // Example invalid payload
-      let contractType = 'other'; // Default type if no type is identified
+    for (let i = startIndex; i < contracts.length; i += parallelRequests) {
+      // Process a batch of contracts in parallel
+      const batch = contracts.slice(i, i + parallelRequests);
+      const typePromises = batch.map(async (contractAddress) => {
+        let contractType = 'other'; // Default contract type
 
-      try {
-        const response = await sendContractQuery(restAddress, contractAddress, testPayload);
-        contractType = response?.contractType || 'other';
-      } catch (error) {
-        log(`Failed to determine type for contract ${contractAddress}: ${error.message}`, 'DEBUG');
-      }
+        try {
+          // Determine the contract type using a test payload
+          const testPayload = { "a": "b" }; // Example invalid payload
+          await sendContractQuery(restAddress, contractAddress, testPayload);
+        } catch (error) {
+          // Parse the error message to extract the contract type
+          const match = error.message.match(/Error parsing into type (\S+)::msg::/);
+          if (match) {
+            contractType = match[1];
+          }
+          log(`Failed to determine type for contract ${contractAddress}: ${error.message}`, 'DEBUG');
+        }
 
-      log(`Identified contract ${contractAddress} as ${contractType}`, 'INFO');
+        log(`Identified contract ${contractAddress} as ${contractType}`, 'INFO');
+        return [contractType, contractAddress];
+      });
 
-      // Add contract type and address to the batch
-      batchData.push([contractType, contractAddress]);
+      // Wait for all parallel requests to complete
+      const results = await Promise.all(typePromises);
+      batchData.push(...results);
 
-      // Once batch is full, write to the database
+      // Insert data into the database when the batch size is reached
       if (batchData.length >= batchSize) {
-        await batchInsert(db.run.bind(db), 'contracts', ['type', 'address'], batchData);
+        await batchInsert(dbRun, 'contracts', ['type', 'address'], batchData);
         log(`Batch inserted ${batchData.length} contract types into the database`, 'INFO');
-        batchData = []; // Clear the batch after writing
+        batchData = []; // Clear the batch after inserting
 
         // Update progress
-        await updateProgress(db, 'identifyContractTypes', 0, contractAddress);
+        await updateProgress(db, 'identifyContractTypes', 0, batch[batch.length - 1]);
       }
     }
 
-    // Insert any remaining data
+    // Insert any remaining data in the last batch
     if (batchData.length > 0) {
-      await batchInsert(db.run.bind(db), 'contracts', ['type', 'address'], batchData);
+      await batchInsert(dbRun, 'contracts', ['type', 'address'], batchData);
       log(`Final batch inserted ${batchData.length} contract types into the database`, 'INFO');
     }
 
@@ -259,9 +356,11 @@ export async function identifyContractTypes(restAddress, db) {
   }
 }
 
-// Fetch and store tokens for contracts of specific types
+// Fetch and store tokens for contracts of specific types using parallel processing and batch inserts
 export async function fetchAndStoreTokensForContracts(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
+  const dbRun = promisify(db.run).bind(db);
+  const parallelRequests = 10; // Number of parallel requests for fetching tokens
 
   try {
     const progress = await checkProgress(db, 'fetchTokens');
@@ -274,34 +373,39 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
     const contractsResult = await dbAll("SELECT address, type FROM contracts WHERE type IN ('cw404', 'cw721_base', 'cw1155')");
     const startIndex = progress.last_processed ? contractsResult.findIndex(c => c.address === progress.last_processed) + 1 : 0;
 
-    for (let i = startIndex; i < contractsResult.length; i++) {
-      const { address: contractAddress, type: contractType } = contractsResult[i];
-      let allTokensFetched = [];
+    for (let i = startIndex; i < contractsResult.length; i += parallelRequests) {
+      const batch = contractsResult.slice(i, i + parallelRequests);
 
-      try {
-        // Fetch all tokens for the current contract
-        allTokensFetched = await fetchAllTokensForContract(restAddress, contractAddress, progress.last_fetched_token);
+      // Process contracts in parallel
+      const tokenPromises = batch.map(async ({ address: contractAddress, type: contractType }) => {
+        try {
+          // Fetch all tokens for the current contract
+          const allTokensFetched = await fetchAllTokensForContract(restAddress, contractAddress, progress.last_fetched_token);
 
-        // Insert fetched tokens into the contract_tokens table
-        if (allTokensFetched.length > 0) {
-          const insertData = allTokensFetched.map(tokenId => [contractAddress, tokenId, contractType]);
-          await batchInsert(db.run.bind(db), 'contract_tokens', ['contract_address', 'token_id', 'contract_type'], insertData);
-          log(`Stored ${allTokensFetched.length} tokens for contract ${contractAddress}`, 'INFO');
+          // Insert fetched tokens into the contract_tokens table
+          if (allTokensFetched.length > 0) {
+            const insertData = allTokensFetched.map(tokenId => [contractAddress, tokenId, contractType]);
+            await batchInsert(dbRun, 'contract_tokens', ['contract_address', 'token_id', 'contract_type'], insertData);
+            log(`Stored ${allTokensFetched.length} tokens for contract ${contractAddress}`, 'INFO');
 
-          // Update the token_ids column in the contracts table
-          const tokenIdsString = allTokensFetched.join(',');
-          await db.run(`UPDATE contracts SET token_ids = ? WHERE address = ?`, [tokenIdsString, contractAddress]);
-          log(`Updated token_ids for contract ${contractAddress}: ${tokenIdsString}`, 'INFO');
-        } else {
-          log(`No tokens found for contract ${contractAddress}`, 'INFO');
+            // Update the token_ids column in the contracts table
+            const tokenIdsString = allTokensFetched.join(',');
+            await dbRun(`UPDATE contracts SET token_ids = ? WHERE address = ?`, [tokenIdsString, contractAddress]);
+            log(`Updated token_ids for contract ${contractAddress}: ${tokenIdsString}`, 'INFO');
+          } else {
+            log(`No tokens found for contract ${contractAddress}`, 'INFO');
+          }
+
+          // Update progress after processing each contract
+          await updateProgress(db, 'fetchTokens', 0, contractAddress, null);
+        } catch (error) {
+          log(`Error fetching tokens for contract ${contractAddress}: ${error.message}`, 'ERROR');
         }
+      });
 
-      } catch (error) {
-        log(`Error fetching tokens for contract ${contractAddress}: ${error.message}`, 'ERROR');
-      }
-
-      // Update progress after processing each contract
-      await updateProgress(db, 'fetchTokens', 0, contractAddress, null);
+      // Wait for all promises in the batch to complete
+      await Promise.all(tokenPromises);
+      log(`Processed a batch of ${batch.length} contracts`, 'INFO');
     }
 
     log('Finished processing tokens for all relevant contracts', 'INFO');
@@ -312,7 +416,7 @@ export async function fetchAndStoreTokensForContracts(restAddress, db) {
   }
 }
 
-// Helper function to fetch all tokens for a specific contract
+// Helper function to fetch all tokens for a specific contract with optimized pagination
 async function fetchAllTokensForContract(restAddress, contractAddress, lastFetchedToken) {
   let startAfter = lastFetchedToken || null;
   let allTokens = [];
@@ -355,9 +459,11 @@ async function fetchAllTokensForContract(restAddress, contractAddress, lastFetch
   return allTokens;
 }
 
-// Fetch owner wallet address for each token_id in each collection
+// Fetch owner wallet address for each token_id in each collection using parallel processing and batch inserts
 export async function fetchAndStoreTokenOwners(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
+  const dbRun = promisify(db.run).bind(db);
+  const parallelRequests = 10; // Number of parallel requests to fetch token ownership
 
   try {
     const progress = await checkProgress(db, 'fetchTokenOwners');
@@ -370,23 +476,23 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
     const contractTokensResult = await getContractTokensToProcess(db, progress);
     log(`Fetched ${contractTokensResult.length} tokens from contract_tokens.`);
 
-    const batchSize = 50;
-    const ownershipData = [];
+    for (let i = 0; i < contractTokensResult.length; i += parallelRequests) {
+      const batch = contractTokensResult.slice(i, i + parallelRequests);
+      const ownershipData = [];
 
-    for (let i = 0; i < contractTokensResult.length; i += batchSize) {
-      const batch = contractTokensResult.slice(i, i + batchSize);
+      // Process token ownership in parallel
       await processTokenOwnershipBatch(restAddress, batch, ownershipData);
 
-      // Perform batch insert into nft_owners table if data exists
+      // Perform batch insert into nft_owners table if ownership data exists
       if (ownershipData.length > 0) {
-        await batchInsert(db.run.bind(db), 'nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], ownershipData);
-        ownershipData.length = 0; // Clear the batch after insert
+        await batchInsert(dbRun, 'nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], ownershipData);
+        log(`Inserted ${ownershipData.length} ownership records into nft_owners table.`, 'INFO');
       }
 
       // Update progress after processing the batch
       const lastToken = batch[batch.length - 1];
       await updateProgress(db, 'fetchTokenOwners', 0, lastToken.contract_address, lastToken.token_id);
-      log(`Processed ${i + batchSize} tokens so far.`, 'INFO');
+      log(`Processed a batch of ${batch.length} tokens.`, 'INFO');
     }
 
     log('Finished processing token ownership for all contracts.', 'INFO');
@@ -397,7 +503,7 @@ export async function fetchAndStoreTokenOwners(restAddress, db) {
   }
 }
 
-// Helper function to get contract tokens that need processing
+// Helper function to get contract tokens that need processing, with improved query handling
 async function getContractTokensToProcess(db, progress) {
   const dbAll = promisify(db.all).bind(db);
   let contractTokensQuery = 'SELECT contract_address, token_id, contract_type FROM contract_tokens';
@@ -408,10 +514,15 @@ async function getContractTokensToProcess(db, progress) {
     params = [progress.last_processed_contract_address, progress.last_processed_contract_address, progress.last_processed_token_id];
   }
 
-  return dbAll(contractTokensQuery, params);
+  try {
+    return await dbAll(contractTokensQuery, params);
+  } catch (error) {
+    log(`Error fetching contract tokens: ${error.message}`, 'ERROR');
+    throw error;
+  }
 }
 
-// Helper function to process a batch of token ownerships
+// Helper function to process a batch of token ownerships using parallel processing
 async function processTokenOwnershipBatch(restAddress, batch, ownershipData) {
   const fetchPromises = batch.map(({ contract_address: contractAddress, token_id: tokenId, contract_type: contractType }) => 
     fetchTokenOwner(restAddress, contractAddress, tokenId, contractType, ownershipData)
@@ -512,18 +623,27 @@ export async function fetchAndStorePointerData(pointerApi, db) {
         const response = await retryOperation(() => axios.post(pointerApi, payload));
 
         if (response.status === 200 && Array.isArray(response.data)) {
-          const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer }) => [
+          // Prepare data for batch insertion
+          const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer, pointerType }) => [
             address,
             pointerAddress || null,
             pointeeAddress || null,
             isBaseAsset ? 1 : 0,
-            isPointer ? 1 : 0
+            isPointer ? 1 : 0,
+            pointerType || null
           ]);
 
-          await batchInsert(dbRun, 'pointer_data', ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer'], batchData);
-          log(`Stored pointer data for ${batchData.length} addresses.`, 'DEBUG');
+          // Perform batch insert into the pointer_data table, with the new column for pointer_type
+          await batchInsert(
+            dbRun, 
+            'pointer_data', 
+            ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer', 'pointer_type'], 
+            batchData
+          );
+
+          log(`Stored pointer data for ${batchData.length} addresses in the current batch.`, 'DEBUG');
         } else {
-          log(`Failed to fetch pointer data. Status: ${response.status}`, 'ERROR');
+          log(`Failed to fetch pointer data. Status: ${response.status}. Response data might be malformed or unexpected.`, 'ERROR');
         }
       } catch (error) {
         log(`Error processing pointer data chunk: ${error.message}`, 'ERROR');
