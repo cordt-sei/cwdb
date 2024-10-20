@@ -45,7 +45,11 @@ async function initializeDatabase(db) {
     `CREATE TABLE IF NOT EXISTS contracts (
       code_id TEXT,
       address TEXT PRIMARY KEY,
-      type TEXT
+      type TEXT,
+      creator TEXT,
+      admin TEXT,
+      label TEXT,
+      token_ids TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS contract_history (
       contract_address TEXT,
@@ -105,7 +109,7 @@ async function runIndexer() {
     await initializeDatabase(db);
     log('Database initialized successfully.', 'INFO');
 
-    // Define the sequence of steps
+    // Define the sequence of steps with retries
     const steps = [
       { name: 'fetchCodeIds', action: () => fetchAndStoreCodeIds(config.restAddress, db) },
       { name: 'fetchContracts', action: () => fetchAndStoreContractsByCode(config.restAddress, db) },
@@ -117,30 +121,54 @@ async function runIndexer() {
       { name: 'fetchAssociatedWallets', action: () => fetchAndStoreAssociatedWallets(config.evmRpcAddress, db) }
     ];
 
+    let allStepsCompleted = true;
+
     // Execute each step sequentially
     for (const step of steps) {
-      const progress = await checkProgress(db, step.name);
-      log(`Progress for ${step.name}: completed=${progress.completed}`, 'DEBUG');
-    
-      if (!progress.completed) {
-        log(`Starting step: ${step.name}`, 'INFO');
-        try {
-          await step.action();
-          await updateProgress(db, step.name, 1);
-          log(`Completed step: ${step.name}`, 'INFO');
-        } catch (error) {
-          log(`Error during step "${step.name}": ${error.message}`, 'ERROR');
-          throw error; // Stop execution if any step fails
+      let retries = 3; // Allow for 3 retry attempts
+      let completed = false;
+
+      while (retries > 0 && !completed) {
+        const progress = await checkProgress(db, step.name);
+        log(`Progress for ${step.name}: completed=${progress.completed}`, 'DEBUG');
+
+        if (!progress.completed) {
+          log(`Starting step: ${step.name}`, 'INFO');
+          try {
+            await step.action();
+            await updateProgress(db, step.name, 1);
+            log(`Completed step: ${step.name}`, 'INFO');
+            completed = true; // Mark as completed to exit the retry loop
+          } catch (error) {
+            retries--;
+            log(`Error during step "${step.name}": ${error.message}. Retries left: ${retries}`, 'ERROR');
+            if (retries === 0) {
+              allStepsCompleted = false;
+              log(`Failed step "${step.name}" after multiple retries.`, 'ERROR');
+              break; // Exit retry loop after all attempts fail
+            }
+          }
+        } else {
+          completed = true;
+          log(`Skipping step: ${step.name} (already completed)`, 'DEBUG');
         }
-      } else {
-        log(`Skipping step: ${step.name} (already completed)`, 'DEBUG');
+      }
+
+      // If a step ultimately fails, break out of the entire indexing process
+      if (!completed) {
+        log(`Aborting indexing due to failure in step: ${step.name}`, 'ERROR');
+        allStepsCompleted = false;
+        break;
       }
     }
 
-    log('All indexing steps completed successfully.', 'INFO');
-
-    // WebSocket monitoring (if applicable)
-    setupWebSocket(config.wsAddress, handleMessage, log);
+    if (allStepsCompleted) {
+      log('All indexing steps completed successfully.', 'INFO');
+      // WebSocket monitoring (if applicable)
+      setupWebSocket(config.wsAddress, handleMessage, log);
+    } else {
+      log('Not all steps were completed successfully. Skipping WebSocket setup.', 'ERROR');
+    }
   } catch (error) {
     log(`Failed to run indexer: ${error.message}`, 'ERROR');
     if (error.stack) {
@@ -148,6 +176,7 @@ async function runIndexer() {
     }
   }
 }
+
 
 // WebSocket handler
 function handleMessage(message) {

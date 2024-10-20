@@ -14,7 +14,7 @@ import { Buffer } from 'buffer';
 import axios from 'axios';
 import { config } from './config.js';
 
-// Fetch all code IDs and store them in the database
+// Fetch all code IDs and store them in the database with progress tracking
 export async function fetchAndStoreCodeIds(restAddress, db) {
   const dbRun = promisify(db.run).bind(db);
 
@@ -36,34 +36,32 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
         ...(startAfter && { 'pagination.key': startAfter }),
       };
 
-      // Fetch paginated data
       const response = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code`,
         'code_infos',
-        config.paginationLimit,
-        'query',
-        payload
+        {
+          limit: config.paginationLimit,
+          paginationType: 'query',
+          useNextKey: true,
+          paginationPayload: payload
+        }
       );
 
-      // Check if there are no more items to fetch
       if (!Array.isArray(response) || response.length === 0) {
         log('No more code IDs to fetch.', 'INFO');
         break;
       }
 
-      // Prepare batch data for inserting code IDs
       const batchData = response.map(({ code_id, creator, data_hash, instantiate_permission }) => [
         code_id, 
         creator, 
         data_hash, 
-        JSON.stringify(instantiate_permission),
+        JSON.stringify(instantiate_permission)
       ]);
 
-      // Perform batch insert
       await batchInsert(dbRun, 'code_ids', ['code_id', 'creator', 'data_hash', 'instantiate_permission'], batchData);
       log(`Inserted ${batchData.length} code IDs into the database.`, 'INFO');
 
-      // Update progress after processing the batch
       allCodeInfos = allCodeInfos.concat(response);
       startAfter = Buffer.from(response[response.length - 1].code_id).toString('base64');
       hasMore = response.length === config.paginationLimit;
@@ -71,7 +69,6 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
       await updateProgress(db, 'fetchCodeIds', 0, response[response.length - 1].code_id);
     }
 
-    // Mark as completed if any code IDs were fetched
     if (allCodeInfos.length > 0) {
       log(`Total code IDs fetched and stored: ${allCodeInfos.length}`, 'INFO');
       await updateProgress(db, 'fetchCodeIds', 1, null);
@@ -84,7 +81,7 @@ export async function fetchAndStoreCodeIds(restAddress, db) {
   }
 }
 
-// Fetch contracts by code and store them in the database using batch insert
+// Fetch contracts by code and store them in the database using batch insert with improved tracking
 export async function fetchAndStoreContractsByCode(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
 
@@ -103,10 +100,9 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
     for (let i = startIndex; i < codeIds.length; i++) {
       const code_id = codeIds[i];
 
-      // Fetch contracts associated with the code_id using pagination
       const contracts = await fetchPaginatedData(
         `${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`,
-        'contracts', // Specify the key to extract from the response
+        'contracts',
         {
           limit: config.paginationLimit,
           paginationType: 'query',
@@ -117,17 +113,21 @@ export async function fetchAndStoreContractsByCode(restAddress, db) {
       if (contracts.length > 0) {
         log(`Fetched ${contracts.length} contracts for code_id: ${code_id}`, 'INFO');
 
-        // Prepare batch data for insertion
-        const batchData = contracts.map(contractAddress => [code_id, contractAddress]);
+        // Fetch additional metadata for each contract
+        const batchData = [];
+        for (const contractAddress of contracts) {
+          const contractInfo = await sendContractQuery(`${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`, null);
+          const { creator, admin, label } = contractInfo.contract_info || {};
 
-        // Perform batch insert
-        await batchInsert(db.run.bind(db), 'contracts', ['code_id', 'address'], batchData);
+          batchData.push([code_id, contractAddress, null, creator, admin, label]);
+        }
+
+        await batchInsert(db.run.bind(db), 'contracts', ['code_id', 'address', 'type', 'creator', 'admin', 'label'], batchData);
         log(`Batch inserted ${batchData.length} contracts for code_id: ${code_id}`, 'INFO');
       } else {
         log(`No contracts found for code_id: ${code_id}`, 'INFO');
       }
 
-      // Update progress after processing each code_id
       await updateProgress(db, 'fetchContracts', 0, code_id);
     }
 
@@ -441,19 +441,43 @@ async function fetchTokenOwner(restAddress, contractAddress, tokenId, contractTy
   }
 }
 
-// Fetch and store CW404 specific details
+// Fetch and store CW404 contract details
 export async function fetchCW404Details(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
 
   try {
-    const cw404Contracts = await getCW404Contracts(dbAll);
+    log('Fetching CW404 contracts from the database...', 'DEBUG');
+    const cw404Contracts = await dbAll("SELECT address FROM contracts WHERE type = 'cw404'");
+    
     if (cw404Contracts.length === 0) {
       log('No CW404 contracts found to process.', 'INFO');
       return;
     }
+    log(`Found ${cw404Contracts.length} CW404 contracts to process.`, 'DEBUG');
 
-    await processCW404Contracts(cw404Contracts, restAddress, dbRun);
+    // Process each CW404 contract
+    for (const { address } of cw404Contracts) {
+      try {
+        const detailsPayload = { cw404_info: {} };
+        const { data, status } = await sendContractQuery(restAddress, address, detailsPayload);
+
+        if (status === 200 && data) {
+          const insertSQL = `
+            INSERT OR REPLACE INTO contract_details 
+            (contract_address, base_uri, max_supply, royalty_percentage) 
+            VALUES (?, ?, ?, ?)
+          `;
+          await dbRun(insertSQL, [address, data.base_uri, data.max_edition, data.royalty_percentage]);
+          log(`Stored CW404 details for contract ${address}.`, 'INFO');
+        } else {
+          log(`No details found for CW404 contract ${address}.`, 'INFO');
+        }
+      } catch (error) {
+        log(`Error processing CW404 contract ${address}: ${error.message}`, 'ERROR');
+      }
+    }
+
     log('Finished processing CW404 contract details.', 'INFO');
   } catch (error) {
     log(`Error in fetchCW404Details: ${error.message}`, 'ERROR');
@@ -461,58 +485,53 @@ export async function fetchCW404Details(restAddress, db) {
   }
 }
 
-// Helper function to get CW404 contracts from the database
-async function getCW404Contracts(dbAll) {
-  log('Fetching CW404 contracts from the database...', 'DEBUG');
-  return dbAll("SELECT address FROM contracts WHERE type = 'cw404'");
-}
-
-// Helper function to process CW404 contracts and store details
-async function processCW404Contracts(cw404Contracts, restAddress, dbRun) {
-  const fetchPromises = cw404Contracts.map(async ({ address }) => {
-    try {
-      await fetchAndStoreCW404Details(restAddress, address, dbRun);
-    } catch (error) {
-      log(`Error processing CW404 contract ${address}: ${error.message}`, 'ERROR');
-    }
-  });
-
-  // Execute all promises in parallel
-  await Promise.all(fetchPromises);
-}
-
-// Helper function to fetch CW404 details and store them in the database
-async function fetchAndStoreCW404Details(restAddress, contractAddress, dbRun) {
-  const detailsPayload = { cw404_info: {} };
-  const { data, status } = await sendContractQuery(restAddress, contractAddress, detailsPayload);
-
-  if (status === 200 && data) {
-    const insertSQL = `
-      INSERT OR REPLACE INTO contract_details 
-      (contract_address, base_uri, max_supply, royalty_percentage) 
-      VALUES (?, ?, ?, ?)
-    `;
-    await dbRun(insertSQL, [contractAddress, data.base_uri, data.max_edition, data.royalty_percentage]);
-
-    log(`Stored CW404 details for contract ${contractAddress}.`, 'INFO');
-  } else {
-    log(`No details found for CW404 contract ${contractAddress}.`, 'INFO');
-  }
-}
-
-// Fetch and store pointer data in chunks to avoid request size limitations
+// Fetch and store pointer data for all contracts
 export async function fetchAndStorePointerData(pointerApi, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
 
   try {
-    const contractAddresses = await getContractAddresses(dbAll);
+    // Fetch all contract addresses from the database
+    log('Fetching contract addresses from the database...', 'DEBUG');
+    const contractsResult = await dbAll('SELECT address FROM contracts');
+    const contractAddresses = contractsResult.map(row => row.address);
+
     if (contractAddresses.length === 0) {
       log('No contracts found to process for pointer data.', 'INFO');
       return;
     }
+    log(`Found ${contractAddresses.length} contracts to process for pointer data.`, 'DEBUG');
 
-    await processPointerDataInChunks(contractAddresses, pointerApi, dbRun);
+    // Process pointer data in chunks
+    const chunkSize = 10;
+    for (let i = 0; i < contractAddresses.length; i += chunkSize) {
+      const chunk = contractAddresses.slice(i, i + chunkSize);
+      const payload = { addresses: chunk };
+
+      try {
+        const response = await retryOperation(() => axios.post(pointerApi, payload));
+
+        if (response.status === 200 && Array.isArray(response.data)) {
+          const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer }) => [
+            address,
+            pointerAddress || null,
+            pointeeAddress || null,
+            isBaseAsset ? 1 : 0,
+            isPointer ? 1 : 0
+          ]);
+
+          await batchInsert(dbRun, 'pointer_data', ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer'], batchData);
+          log(`Stored pointer data for ${batchData.length} addresses.`, 'DEBUG');
+        } else {
+          log(`Failed to fetch pointer data. Status: ${response.status}`, 'ERROR');
+        }
+      } catch (error) {
+        log(`Error processing pointer data chunk: ${error.message}`, 'ERROR');
+      }
+    }
+
+    // Mark the step as completed in the indexer progress table
+    await updateProgress(db, 'fetchPointerData', 1);
     log('Finished processing pointer data for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchAndStorePointerData: ${error.message}`, 'ERROR');
@@ -520,111 +539,67 @@ export async function fetchAndStorePointerData(pointerApi, db) {
   }
 }
 
-// Helper function to fetch all contract addresses from the database
-async function getContractAddresses(dbAll) {
-  log('Fetching contract addresses from the database...', 'DEBUG');
-  const contractsResult = await dbAll('SELECT address FROM contracts');
-  return contractsResult.map(row => row.address);
-}
-
-// Helper function to process pointer data in chunks
-async function processPointerDataInChunks(contractAddresses, pointerApi, dbRun, chunkSize = 10) {
-  for (let i = 0; i < contractAddresses.length; i += chunkSize) {
-    const chunk = contractAddresses.slice(i, i + chunkSize);
-    const payload = { addresses: chunk };
-
-    try {
-      await fetchAndStorePointerChunk(pointerApi, payload, dbRun);
-    } catch (error) {
-      log(`Error processing pointer data chunk: ${error.message}`, 'ERROR');
-    }
-  }
-}
-
-// Helper function to fetch and store pointer data for a chunk
-async function fetchAndStorePointerChunk(pointerApi, payload, dbRun) {
-  const response = await axios.post(pointerApi, payload);
-  if (response.status === 200 && response.data) {
-    for (const entry of response.data) {
-      const { address, pointerAddress, pointeeAddress, isBaseAsset, isPointer } = entry;
-      const insertSQL = `
-        INSERT OR REPLACE INTO pointer_data (contract_address, pointer_address, pointee_address, is_base_asset, is_pointer)
-        VALUES (?, ?, ?, ?, ?)
-      `;
-      await dbRun(insertSQL, [
-        address,
-        pointerAddress || null,
-        pointeeAddress || null,
-        isBaseAsset ? 1 : 0, // 1 for true, 0 for false
-        isPointer ? 1 : 0    // 1 for true, 0 for false
-      ]);
-      log(`Stored pointer data for address ${address}`, 'DEBUG');
-    }
-  } else {
-    log(`Failed to fetch pointer data. Status: ${response.status}`, 'ERROR');
-  }
-}
-
 // Fetch and store associated wallet addresses based on EVM address lookup
-export async function fetchAndStoreAssociatedWallets(evmRpcAddress, db) {
+export async function fetchAndStoreAssociatedWallets(evmRpcAddress, db, concurrencyLimit = 5) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
 
   try {
-    const owners = await getUniqueOwners(dbAll);
+    log('Starting fetchAndStoreAssociatedWallets...', 'DEBUG');
+
+    // Fetch unique owners from the 'nft_owners' table
+    const owners = await dbAll('SELECT DISTINCT owner FROM nft_owners');
     if (owners.length === 0) {
       log('No unique owners found in nft_owners table.', 'INFO');
       return;
     }
+    log(`Found ${owners.length} unique owners in nft_owners table.`, 'DEBUG');
 
-    await processOwnersForEVMAddress(owners, evmRpcAddress, dbRun);
+    // Limit the number of concurrent requests to avoid overloading the endpoint
+    const processBatch = async (batch) => {
+      await Promise.all(batch.map(async (row) => {
+        const owner = row.owner;
+        log(`Fetching EVM address for owner: ${owner}`, 'DEBUG');
+
+        const payload = {
+          jsonrpc: "2.0",
+          method: "sei_getEVMAddress",
+          params: [owner],
+          id: 1
+        };
+
+        try {
+          // Attempt to fetch the EVM address with retry logic
+          const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
+          if (response.status === 200 && response.data?.result) {
+            const evmAddress = response.data.result;
+            log(`Fetched EVM address for ${owner}: ${evmAddress}`, 'DEBUG');
+
+            // Store the EVM address in the 'wallet_associations' table
+            const insertSQL = `
+              INSERT OR REPLACE INTO wallet_associations (wallet_address, evm_address)
+              VALUES (?, ?)
+            `;
+            await dbRun(insertSQL, [owner, evmAddress]);
+            log(`Stored EVM address ${evmAddress} for wallet ${owner}`, 'DEBUG');
+          } else {
+            log(`No EVM address found for owner: ${owner}`, 'INFO');
+          }
+        } catch (error) {
+          log(`Error processing owner ${owner}: ${error.message}`, 'ERROR');
+        }
+      }));
+    };
+
+    // Process owners in batches to limit concurrency
+    for (let i = 0; i < owners.length; i += concurrencyLimit) {
+      const batch = owners.slice(i, i + concurrencyLimit);
+      log(`Processing batch of ${batch.length} owners...`, 'DEBUG');
+      await processBatch(batch);
+    }
     log('Finished processing associated wallets.', 'INFO');
   } catch (error) {
     log(`Error in fetchAndStoreAssociatedWallets: ${error.message}`, 'ERROR');
     throw error;
-  }
-}
-
-// Helper function to get unique owners from the database
-async function getUniqueOwners(dbAll) {
-  log('Fetching unique owners from the nft_owners table...', 'DEBUG');
-  const ownersResult = await dbAll('SELECT DISTINCT owner FROM nft_owners');
-  return ownersResult.map(row => row.owner);
-}
-
-// Helper function to process owners and fetch their EVM addresses
-async function processOwnersForEVMAddress(owners, evmRpcAddress, dbRun) {
-  const fetchPromises = owners.map(async (owner) => {
-    try {
-      await fetchAndStoreEVMAddressForOwner(owner, evmRpcAddress, dbRun);
-    } catch (error) {
-      log(`Error processing owner ${owner}: ${error.message}`, 'ERROR');
-    }
-  });
-
-  // Execute all fetch operations in parallel
-  await Promise.all(fetchPromises);
-}
-
-// Helper function to fetch and store the EVM address for an owner
-async function fetchAndStoreEVMAddressForOwner(owner, evmRpcAddress, dbRun) {
-  const payload = {
-    jsonrpc: "2.0",
-    method: "sei_getEVMAddress",
-    params: [owner],
-    id: 1
-  };
-
-  const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
-  if (response.status === 200 && response.data && response.data.result) {
-    const evmAddress = response.data.result;
-    const insertSQL = `
-      INSERT OR REPLACE INTO wallet_associations (wallet_address, evm_address)
-      VALUES (?, ?)
-    `;
-    await dbRun(insertSQL, [owner, evmAddress]);
-    log(`Stored EVM address ${evmAddress} for wallet ${owner}`, 'DEBUG');
-  } else {
-    log(`Failed to fetch EVM address for wallet ${owner}.`, 'ERROR');
   }
 }
