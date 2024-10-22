@@ -64,7 +64,7 @@ export async function retryOperation(operation, retries = 3, delay = 1000) {
   }
 }
 
-/// Helper function to fetch paginated data with versatile error handling
+// Helper function to fetch paginated data with configurable logging
 export async function fetchPaginatedData(url, key, options = {}) {
   const {
     limit = 100,
@@ -72,14 +72,17 @@ export async function fetchPaginatedData(url, key, options = {}) {
     paginationPayload = null,
     useNextKey = false,
     onError = null,
-    fallbackKey = null
+    fallbackKey = null,
+    logLevel = 'FINAL_ONLY' // 'DETAILED' or 'FINAL_ONLY'
   } = options;
 
   let allData = [];
   let nextKey = null;
   let startAfter = null;
 
-  log(`Starting paginated data fetch from: ${url}`, 'INFO');
+  if (logLevel === 'DETAILED') {
+    log(`Starting paginated data fetch from: ${url}`, 'INFO');
+  }
 
   while (true) {
     let requestUrl = url;
@@ -106,13 +109,12 @@ export async function fetchPaginatedData(url, key, options = {}) {
 
       if (response.status === 400) {
         log(`Skipping processing due to expected 400 error.`, 'DEBUG');
-        if (onError) onError(response); // Trigger the custom error handler, if provided
-        return allData; // Return what has been collected so far
+        if (onError) onError(response);
+        return allData;
       }
 
-      // Handle unexpected response
       if (!response || response.status !== 200 || !response.data) {
-        log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`, 'ERROR');
+        log(`Unexpected response structure for ${url}`, 'ERROR');
         if (onError) onError(response);
         break;
       }
@@ -121,7 +123,10 @@ export async function fetchPaginatedData(url, key, options = {}) {
       const dataBatch = Array.isArray(dataKey) ? dataKey : [];
       allData = allData.concat(dataBatch);
 
-      log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
+      // Log detailed batch info if configured
+      if (logLevel === 'DETAILED') {
+        log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
+      }
 
       // Pagination continuation
       if (useNextKey && response.data.pagination?.next_key) {
@@ -132,29 +137,28 @@ export async function fetchPaginatedData(url, key, options = {}) {
         break; // End if no more data
       }
 
-      if (dataBatch.length < limit) break;
+      if (dataBatch.length < limit) break; // Last batch fetched
     } catch (error) {
-      log(`Error fetching paginated data: ${error.message}`, 'ERROR');
+      log(`Error fetching paginated data from ${url}: ${error.message}`, 'ERROR');
       if (onError) onError(error);
       throw error;
     }
   }
 
-  log(`Finished fetching data. Total fetched: ${allData.length}`, 'INFO');
+  // Log the final count of fetched items for the given query
+  if (logLevel !== 'NONE') {
+    log(`Finished fetching ${allData.length} items for query ${url}`, 'INFO');
+  }
+
   return allData;
 }
 
-// Contract query function with versatile error handling
+// Contract query function that returns raw response data and status
 export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}, options = {}) {
-  const {
-    fallbackKey = null,
-    onError = null,
-    retryCount = 3
-  } = options;
+  const { retryCount = 3 } = options;
 
   if (!payload || typeof payload !== 'object') {
     log(`Invalid payload for contract ${contractAddress}: ${JSON.stringify(payload)}`, 'ERROR');
-    if (onError) onError(new Error('Invalid payload'));
     return { error: 'Invalid payload', status: 400 };
   }
 
@@ -164,57 +168,39 @@ export async function sendContractQuery(restAddress, contractAddress, payload, h
   log(`Querying contract ${contractAddress} with payload: ${JSON.stringify(payload)}`, 'INFO');
 
   try {
+    // Use the retryOperation helper for the actual request
     const response = await retryOperation(() => axios.get(url, { headers }), retryCount);
 
-    if (response.status === 400) {
-      const match = response.data?.message?.match(/Error parsing into type (\S+)::msg::QueryMsg/);
-      if (match) {
-        const contractType = match[1];
-        log(`Identified contract type from 400 error: ${contractType} for contract ${contractAddress}`, 'INFO');
-        return { data: { contractType }, status: 400 };
-      }
-      log(`400 error for contract ${contractAddress} did not contain recognizable type info`, 'DEBUG');
-      return { error: 'Type not found in 400 response', status: 400 };
-    }
-
-    // Handle successful response
-    const data = response?.data || {};
-    const result = fallbackKey && data[fallbackKey] ? data[fallbackKey] : data;
-
-    if (response.status === 200 && typeof result === 'object') {
-      log(`Query successful for contract ${contractAddress}. Data length: ${JSON.stringify(result).length}`, 'INFO');
-      return { data: result, status: response.status };
-    } else {
-      log(`Unexpected response or status for contract ${contractAddress}: ${response.status}`, 'ERROR');
-      if (onError) onError(new Error('Unexpected response format'));
-      return { error: 'Unexpected response format', status: response.status };
-    }
+    // Return the response status and data directly
+    return { data: response?.data || null, status: response?.status || 500 };
   } catch (error) {
     log(`Error querying contract ${contractAddress}: ${error.message}`, 'ERROR');
-    if (onError) onError(error);
-    return { error: error.message, status: 500 };
+    // Return a consistent response structure even on error
+    return { error: error.message, status: error.response?.status || 500 };
   }
 }
 
-// batchInsert with enhanced logging and conflict handling
+// batchInsert function to handle data insertion with conflict handling
 export async function batchInsert(dbRun, tableName, columns, data) {
   if (data.length === 0) {
     log(`No data to insert into ${tableName}. Skipping batch insert.`, 'INFO');
     return;
   }
 
-  const placeholders = columns.map(() => '?').join(', '); // for each row
+  const placeholders = columns.map(() => '?').join(', ');
   const updateSet = columns
+    .filter(column => column !== 'collection_address' && column !== 'token_id') // Avoid updating key columns
     .map(column => `${column} = excluded.${column}`)
-    .join(', '); // setting update for each column
+    .join(', ');
 
-  // Construct the SQL for inserting or updating on conflict
+  // SQL for inserting or updating on conflict
   const insertSQL = `
     INSERT INTO ${tableName} (${columns.join(', ')})
     VALUES ${data.map(() => `(${placeholders})`).join(', ')}
-    ON CONFLICT(address) DO UPDATE SET ${updateSet}
+    ON CONFLICT(collection_address, token_id) DO UPDATE SET ${updateSet}
   `;
 
+  // Flatten the data for use in the SQL query
   const flatData = data.flat();
 
   try {
@@ -222,7 +208,7 @@ export async function batchInsert(dbRun, tableName, columns, data) {
     log(`Successfully inserted or updated ${data.length} rows into ${tableName}.`, 'INFO');
   } catch (error) {
     log(`Error performing batch insert into ${tableName}: ${error.message}`, 'ERROR');
-    throw error;
+    throw error; // Let the caller handle the error
   }
 }
 
