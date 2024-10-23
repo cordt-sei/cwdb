@@ -1,15 +1,14 @@
 // index.js
 
 import { 
-  fetchAndStoreCodeIds, 
-  fetchAndStoreContractAddressesByCode,
-  fetchAndStoreContractMetadata,
-  fetchAndStoreContractHistory, 
+  fetchCodeIds, 
+  fetchContractAddressesByCodeId,
+  fetchContractMetadata,
+  fetchContractHistory, 
   identifyContractTypes, 
-  fetchAndStoreTokensForContracts, 
-  fetchAndStoreTokenOwners, 
-  fetchAndStorePointerData, 
-  fetchAndStoreAssociatedWallets 
+  processTokensAndOwners, 
+  fetchPointerData, 
+  fetchAssociatedWallets 
 } from './contractHelper.js';
 import { 
   setupWebSocket, 
@@ -115,15 +114,14 @@ async function runIndexer() {
 
     // Define the sequence of steps with retries
     const steps = [
-      { name: 'fetchCodeIds', action: () => fetchAndStoreCodeIds(config.restAddress, db) },
-      { name: 'fetchContractAddressesByCode', action: () => fetchAndStoreContractAddressesByCode(config.restAddress, db) },
-      { name: 'fetchContractMetadata', action: () => fetchAndStoreContractMetadata(config.restAddress, db) },
-      { name: 'fetchContractHistory', action: () => fetchAndStoreContractHistory(config.restAddress, db) },
+      { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress, db) },
+      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress, db) },
+      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress, db) },
+      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress, db) },
       { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
-      { name: 'fetchTokens', action: () => fetchAndStoreTokensForContracts(config.restAddress, db) },
-      { name: 'fetchTokenOwners', action: () => fetchAndStoreTokenOwners(config.restAddress, db) },
-      { name: 'fetchPointerData', action: () => fetchAndStorePointerData(config.pointerApi, db) },
-      { name: 'fetchAssociatedWallets', action: () => fetchAndStoreAssociatedWallets(config.evmRpcAddress, db) }
+      { name: 'processTokensAndOwners', action: () => processTokensAndOwners(config.restAddress, db) },
+      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi, db) },
+      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress, db) }
     ];
 
     let allStepsCompleted = true;
