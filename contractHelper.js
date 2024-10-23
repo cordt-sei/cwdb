@@ -361,11 +361,10 @@ export async function identifyContractTypes(restAddress, db) {
   }
 }
 
-// Fetch tokens, ownership data, and CW404 details in a single pass
 export async function fetchTokensAndOwners(restAddress, db) {
   const dbAll = promisify(db.all).bind(db);
   const dbRun = promisify(db.run).bind(db);
-  const parallelRequests = 10;
+  const parallelRequests = 5;
   const tokenLimit = 100;
 
   try {
@@ -382,25 +381,94 @@ export async function fetchTokensAndOwners(restAddress, db) {
     for (let i = 0; i < contractsResult.length; i += parallelRequests) {
       const batch = contractsResult.slice(i, i + parallelRequests);
       const processingPromises = batch.map(async ({ address: contractAddress, type: contractType }) => {
-        try {
-          // Fetch all tokens for the contract
-          const allTokensFetched = await fetchAllTokensWithOwnership(restAddress, contractAddress, contractType, tokenLimit, progress.last_fetched_token);
+        let allTokens = [];
+        let ownershipData = [];
+        let lastTokenFetched = null;
 
-          if (allTokensFetched.tokens.length > 0) {
-            // Update tokens in the database
-            const tokenIdsString = allTokensFetched.tokens.join(',');
+        try {
+          const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
+          let retryCount = 0;
+          const maxRetries = 3;
+
+          while (true) {
+            // Prepare the payload for fetching tokens
+            const tokenQueryPayload = {
+              all_tokens: {
+                limit: tokenLimit,
+                ...(lastTokenFetched && { start_after_id: lastTokenFetched })
+              }
+            };
+            const encodedPayload = Buffer.from(JSON.stringify(tokenQueryPayload)).toString('base64');
+
+            try {
+              log(`Fetching tokens for ${contractAddress} with start_after_id: ${lastTokenFetched || 'initial'}`, 'DEBUG');
+
+              const response = await axios.post(requestUrl, { base64_encoded_payload: encodedPayload });
+
+              if (response.status === 200 && response.data?.data?.tokens?.length > 0) {
+                const tokenIds = response.data.data.tokens;
+                allTokens.push(...tokenIds);
+                lastTokenFetched = tokenIds[tokenIds.length - 1]; // Update for pagination
+
+                log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Total so far: ${allTokens.length}`, 'INFO');
+
+                // Fetch ownership data if needed
+                if (/721|1155|404/i.test(contractType)) {
+                  const ownershipPromises = tokenIds.map(async tokenId => {
+                    try {
+                      const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
+                      const ownerResponse = await retryOperation(() => axios.post(
+                        `${requestUrl}`,
+                        ownerQueryPayload,
+                        { headers: { 'Content-Type': 'application/json' } }
+                      ));
+
+                      if (ownerResponse.status === 200 && ownerResponse.data?.data?.owner) {
+                        const owner = ownerResponse.data.data.owner;
+                        ownershipData.push([contractAddress, tokenId, owner, contractType]);
+                      }
+                    } catch (ownershipError) {
+                      log(`Error fetching ownership for token ${tokenId} in contract ${contractAddress}: ${ownershipError.message}`, 'ERROR');
+                    }
+                  });
+
+                  await Promise.allSettled(ownershipPromises);
+                }
+
+                // If fewer tokens than limit were fetched, break the pagination loop
+                if (tokenIds.length < tokenLimit) break;
+              } else {
+                log(`No more tokens found for contract ${contractAddress}`, 'INFO');
+                break;
+              }
+            } catch (fetchError) {
+              log(`Error fetching tokens for contract ${contractAddress}: ${fetchError.message}`, 'ERROR');
+
+              if (fetchError.response?.status === 404 && retryCount < maxRetries) {
+                retryCount++;
+                log(`Retrying ${retryCount}/${maxRetries} for ${contractAddress}`, 'WARN');
+                continue;
+              }
+
+              break;
+            }
+          }
+
+          // Update tokens in the database if any were fetched
+          if (allTokens.length > 0) {
+            const tokenIdsString = allTokens.join(',');
             await dbRun("UPDATE contracts SET token_ids = ? WHERE address = ?", [tokenIdsString, contractAddress]);
             log(`Updated token_ids for contract ${contractAddress}: ${tokenIdsString}`, 'INFO');
 
             // Insert token data into contract_tokens table
-            const tokenInsertData = allTokensFetched.tokens.map(tokenId => [contractAddress, tokenId, contractType]);
+            const tokenInsertData = allTokens.map(tokenId => [contractAddress, tokenId, contractType]);
             await batchInsert(dbRun, 'contract_tokens', ['contract_address', 'token_id', 'contract_type'], tokenInsertData);
-            log(`Inserted ${allTokensFetched.tokens.length} tokens into contract_tokens for contract ${contractAddress}`, 'INFO');
+            log(`Inserted ${allTokens.length} tokens into contract_tokens for contract ${contractAddress}`, 'INFO');
 
             // Insert ownership data if available
-            if (allTokensFetched.ownershipData.length > 0) {
-              await batchInsert(dbRun, 'nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], allTokensFetched.ownershipData);
-              log(`Inserted ${allTokensFetched.ownershipData.length} ownership records into nft_owners table.`, 'INFO');
+            if (ownershipData.length > 0) {
+              await batchInsert(dbRun, 'nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], ownershipData);
+              log(`Inserted ${ownershipData.length} ownership records into nft_owners table.`, 'INFO');
             }
           }
 
@@ -409,8 +477,8 @@ export async function fetchTokensAndOwners(restAddress, db) {
             await fetchAndStoreCW404Details(restAddress, contractAddress, dbRun);
           }
 
-          // Update progress after each contract's processing
-          await updateProgress(db, 'processTokens', 0, contractAddress, allTokensFetched.lastFetchedToken);
+          // Update progress after processing
+          await updateProgress(db, 'processTokens', 0, contractAddress, lastTokenFetched);
         } catch (error) {
           log(`Error processing contract ${contractAddress}: ${error.message}`, 'ERROR');
         }
@@ -424,159 +492,9 @@ export async function fetchTokensAndOwners(restAddress, db) {
     await updateProgress(db, 'processTokens', 1);
     log('Finished processing tokens and ownership for all relevant contracts.', 'INFO');
   } catch (error) {
-    log(`Error in processTokensAndOwners: ${error.message}`, 'ERROR');
+    log(`Error in fetchTokensAndOwners: ${error.message}`, 'ERROR');
     throw error;
   }
-}
-
-async function fetchAllTokensWithOwnership(restAddress, contractAddress, contractType, tokenLimit) {
-  let allTokens = [];
-  let ownershipData = [];
-  let lastTokenFetched = null;
-  let retryCount = 0;
-  const maxRetries = 3;
-
-  // Initial query without pagination
-  const tokenQueryPayload = { all_tokens: { limit: tokenLimit } };
-  const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
-
-  try {
-    // Log request details at the start
-    log(`Attempting to fetch tokens for ${contractAddress}`, 'INFO');
-    log(`Request URL: ${requestUrl}`, 'INFO');
-    log(`Payload: ${JSON.stringify(tokenQueryPayload)}`, 'INFO');
-
-    const response = await axios.post(
-      requestUrl,
-      tokenQueryPayload,
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-
-    if (response.status === 200 && response.data?.data?.tokens?.length > 0) {
-      const tokenIds = response.data.data.tokens;
-      allTokens = allTokens.concat(tokenIds);
-      log(`Fetched ${allTokens.length} tokens for contract ${contractAddress}`, 'INFO');
-      lastTokenFetched = tokenIds[tokenIds.length - 1];
-
-      if (/721|1155|404/i.test(contractType)) {
-        const ownershipBatch = await fetchTokenOwnershipData(restAddress, contractAddress, tokenIds, contractType);
-        ownershipData = ownershipData.concat(ownershipBatch);
-      }
-
-      // Paginate if necessary
-      if (tokenIds.length === tokenLimit) {
-        await paginateTokenFetch(restAddress, contractAddress, contractType, tokenLimit, lastTokenFetched, allTokens, ownershipData);
-      }
-    } else {
-      log(`No tokens found for contract ${contractAddress}`, 'INFO');
-    }
-  } catch (error) {
-    logErrorHandling(error, contractAddress, requestUrl, tokenQueryPayload, retryCount, maxRetries);
-  }
-
-  return { tokens: allTokens, ownershipData, lastFetchedToken: lastTokenFetched };
-}
-
-function logErrorHandling(error, contractAddress, requestUrl, tokenQueryPayload, retryCount, maxRetries) {
-  // Log the request details even if an error occurs
-  log(`Error fetching tokens for ${contractAddress}`, 'ERROR');
-  log(`Request URL: ${requestUrl}`, 'ERROR');
-  log(`Payload: ${JSON.stringify(tokenQueryPayload)}`, 'ERROR');
-
-  if (error.response && error.response.data) {
-    log(`Response Data: ${JSON.stringify(error.response.data)}`, 'ERROR');
-  } else {
-    log(`Error Message: ${error.message}`, 'ERROR');
-  }
-
-  if (error.response && error.response.status === 404 && retryCount < maxRetries) {
-    retryCount++;
-    log(`Retry ${retryCount}/${maxRetries} with simplified payload for contract ${contractAddress}`, 'WARN');
-  }
-}
-
-async function paginateTokenFetch(restAddress, contractAddress, contractType, tokenLimit, startAfter, allTokens, ownershipData) {
-  let retryCount = 0;
-  const maxRetries = 3;
-
-  while (true) {
-    const tokenQueryPayload = {
-      all_tokens: {
-        limit: tokenLimit,
-        start_after: startAfter
-      }
-    };
-    const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
-
-    try {
-      log(`Fetching paginated tokens for ${contractAddress} with payload: ${JSON.stringify(tokenQueryPayload)}`, 'DEBUG');
-      log(`Request URL: ${requestUrl}`, 'DEBUG');
-      
-      const response = await axios.post(
-        requestUrl,
-        tokenQueryPayload,
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-
-      if (response.status === 200 && response.data?.data?.tokens?.length > 0) {
-        const tokenIds = response.data.data.tokens;
-        allTokens.push(...tokenIds);
-        log(`Fetched ${allTokens.length} total tokens for contract ${contractAddress}`, 'INFO');
-        startAfter = tokenIds[tokenIds.length - 1];
-
-        if (/721|1155|404/i.test(contractType)) {
-          const ownershipBatch = await fetchTokenOwnershipData(restAddress, contractAddress, tokenIds, contractType);
-          ownershipData.push(...ownershipBatch);
-        }
-
-        if (tokenIds.length < tokenLimit) break;
-      } else {
-        log(`No more tokens found for contract ${contractAddress}`, 'INFO');
-        break;
-      }
-    } catch (error) {
-      if (!handlePaginationError(error, contractAddress, requestUrl, tokenQueryPayload, retryCount, maxRetries)) break;
-    }
-  }
-}
-
-function handlePaginationError(error, contractAddress, requestUrl, tokenQueryPayload, retryCount, maxRetries) {
-  log(`Error during pagination for contract ${contractAddress}: ${error.message}`, 'ERROR');
-  log(`Request URL: ${requestUrl}`, 'ERROR');
-  log(`Payload: ${JSON.stringify(tokenQueryPayload)}`, 'ERROR');
-
-  if (error.response && error.response.status === 404 && retryCount < maxRetries) {
-    retryCount++;
-    log(`Retry ${retryCount}/${maxRetries} for pagination`, 'WARN');
-    return true; // Continue retrying
-  }
-
-  return false; // Stop pagination attempts
-}
-
-// Fetch token ownership data for a batch of tokens
-export async function fetchTokenOwnershipData(restAddress, contractAddress, tokenIds, contractType) {
-  const ownershipData = [];
-  const ownershipPromises = tokenIds.map(async tokenId => {
-    try {
-      const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
-      const response = await retryOperation(() => axios.post(
-        `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`,
-        ownerQueryPayload,
-        { headers: { 'Content-Type': 'application/json' } }
-      ));
-
-      if (response.status === 200 && response.data?.data?.owner) {
-        const owner = response.data.data.owner;
-        ownershipData.push([contractAddress, tokenId, owner, contractType]);
-      }
-    } catch (error) {
-      log(`Error fetching ownership for token ${tokenId} in contract ${contractAddress}: ${error.message}`, 'ERROR');
-    }
-  });
-
-  await Promise.allSettled(ownershipPromises);
-  return ownershipData;
 }
 
 // Fetch and store CW404 contract details

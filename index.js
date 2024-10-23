@@ -1,12 +1,10 @@
-// index.js
-
 import { 
   fetchCodeIds, 
   fetchContractAddressesByCodeId,
   fetchContractMetadata,
   fetchContractHistory, 
   identifyContractTypes, 
-  processTokensAndOwners, 
+  fetchTokensAndOwners, 
   fetchPointerData, 
   fetchAssociatedWallets 
 } from './contractHelper.js';
@@ -109,26 +107,25 @@ async function initializeDatabase(db) {
 // Main function to run the indexer
 async function runIndexer() {
   try {
+    log(`Indexer started with log level: ${config.logLevel}`, 'INFO');
     await initializeDatabase(db);
     log('Database initialized successfully.', 'INFO');
 
-    // Define the sequence of steps with retries
     const steps = [
       { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress, db) },
       { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress, db) },
       { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress, db) },
       { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress, db) },
       { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
-      { name: 'processTokensAndOwners', action: () => processTokensAndOwners(config.restAddress, db) },
+      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress, db) },
       { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi, db) },
       { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress, db) }
     ];
 
     let allStepsCompleted = true;
 
-    // Execute each step sequentially
     for (const step of steps) {
-      let retries = 3; // Allow for 3 retry attempts
+      let retries = 3;
       let completed = false;
 
       while (retries > 0 && !completed) {
@@ -141,14 +138,14 @@ async function runIndexer() {
             await step.action();
             await updateProgress(db, step.name, 1);
             log(`Completed step: ${step.name}`, 'INFO');
-            completed = true; // Mark as completed to exit the retry loop
+            completed = true;
           } catch (error) {
             retries--;
             log(`Error during step "${step.name}": ${error.message}. Retries left: ${retries}`, 'ERROR');
             if (retries === 0) {
               allStepsCompleted = false;
               log(`Failed step "${step.name}" after multiple retries.`, 'ERROR');
-              break; // Exit retry loop after all attempts fail
+              break;
             }
           }
         } else {
@@ -157,7 +154,6 @@ async function runIndexer() {
         }
       }
 
-      // If a step ultimately fails, break out of the entire indexing process
       if (!completed) {
         log(`Aborting indexing due to failure in step: ${step.name}`, 'ERROR');
         allStepsCompleted = false;
@@ -167,7 +163,6 @@ async function runIndexer() {
 
     if (allStepsCompleted) {
       log('All indexing steps completed successfully.', 'INFO');
-      // WebSocket monitoring (if applicable)
       setupWebSocket(config.wsAddress, handleMessage, log);
     } else {
       log('Not all steps were completed successfully. Skipping WebSocket setup.', 'ERROR');

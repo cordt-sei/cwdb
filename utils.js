@@ -1,32 +1,32 @@
 // utils.js
 
-import axios from 'axios';
-import WebSocket from 'ws';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
+import WebSocket from 'ws';
 import { promisify } from 'util';
+import { config } from './config.js';
 
-// Updated logging function with levels and configurable filtering
-export function log(message, level = 'INFO', logToFile = true) {
+export function log(message, level = 'INFO') {
   const logLevels = { 'ERROR': 0, 'INFO': 1, 'DEBUG': 2 };
-  const currentLogLevel = process.env.LOG_LEVEL || 'INFO'; // Allow setting log level via environment variable
-  
+  const currentLogLevel = config.logLevel || 'INFO';
+
   // Skip logging if the message level is below the current log level
   if (logLevels[level] > logLevels[currentLogLevel]) {
     return;
   }
-  
+
   // Format the log message with the current timestamp and level
   const timestamp = new Date().toISOString();
   const formattedMessage = `[${timestamp}] [${level}] ${message}`;
-  
+
   // Always log to the console if the level is ERROR, otherwise based on level
   if (level === 'ERROR' || currentLogLevel === 'DEBUG') {
     console.log(formattedMessage);
   }
 
-  // Log to file if logToFile is true and level is not DEBUG
-  if (logToFile && level !== 'DEBUG') {
+  // Log to file if config.logToFile is true and level is not DEBUG
+  if (config.logToFile && level !== 'DEBUG') {
     const logDir = './logs';
     const logFile = path.join(logDir, 'data_collection.log');
 
@@ -52,14 +52,41 @@ export async function retryOperation(operation, retries = 3, delay = 1000, backo
         log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`, 'INFO');
         const jitter = Math.random() * delay;
         await new Promise(resolve => setTimeout(resolve, delay + jitter));
-        delay *= backoffFactor; // Increase delay for next attempt
+        delay *= backoffFactor;
       }
     }
   }
   log(`Operation failed after ${retries} retries: ${lastError.message}`, 'ERROR');
-  throw lastError; // Throw the last encountered error
+  throw lastError;
 }
 
+// Contract query function that logs details and handles responses
+export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false) {
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
+  const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
+
+  log(`Attempting to query contract: ${contractAddress}`, 'DEBUG');
+  log(`Request URL: ${requestUrl}`, 'DEBUG');
+
+  try {
+    const response = usePost
+      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload })
+      : await axios.get(`${requestUrl}/${encodedPayload}`);
+
+    if (response.status === 200) {
+      log(`Successfully queried contract: ${contractAddress}`, 'INFO');
+      return response.data;
+    } else {
+      log(`Unexpected response status: ${response.status}`, 'ERROR');
+      return null;
+    }
+  } catch (error) {
+    log(`Error querying contract: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+// Fetch paginated data with various pagination strategies
 export async function fetchPaginatedData(url, key, options = {}) {
   const {
     limit = 100,
@@ -70,22 +97,33 @@ export async function fetchPaginatedData(url, key, options = {}) {
     retries = 3,
     delay = 1000,
     backoffFactor = 2,
-    handleError = null // Optional custom error handling callback
+    handleError = null,
+    skipPagination = false
   } = options;
+
+  if (skipPagination) {
+    // If pagination is skipped, just make a single request
+    const operation = async () => axios.get(url, { params: paginationPayload });
+    const response = await retryOperation(operation, retries, delay, backoffFactor);
+    if (!response || response.status !== 200 || !response.data) {
+      log(`Unexpected response structure for ${url}`, 'ERROR');
+      throw new Error(`Unexpected response status: ${response?.status}`);
+    }
+    return response.data[key] || [];
+  }
 
   let allData = [];
   let nextKey = null;
   let startAfter = null;
 
   if (logLevel === 'DETAILED') {
-    log(`Starting paginated data fetch from: ${url}`, 'INFO');
+    log(`Fetching data from: ${url}`, 'INFO');
   }
 
   while (true) {
     let requestUrl = url;
     let payload;
 
-    // Determine the pagination strategy based on paginationType
     switch (paginationType) {
       case 'offset':
         const offsetParams = new URLSearchParams();
@@ -101,37 +139,20 @@ export async function fetchPaginatedData(url, key, options = {}) {
           ...(!useNextKey && startAfter ? { start_after: startAfter } : {})
         };
         break;
-      case 'cursor':
-        // Implement cursor-based pagination if applicable
-        payload = {
-          ...paginationPayload,
-          'pagination.cursor': nextKey || '',
-          'pagination.limit': limit
-        };
-        break;
       default:
         throw new Error(`Unsupported pagination type: ${paginationType}`);
     }
 
     const operation = async () => {
-      try {
-        if (paginationType === 'offset') {
-          return await axios.get(requestUrl);
-        } else {
-          return await axios.get(requestUrl, { params: payload });
-        }
-      } catch (error) {
-        if (handleError) {
-          // Allow custom error handling
-          return await handleError(error);
-        }
-        throw error; // Default behavior if no custom handler is provided
+      if (paginationType === 'offset') {
+        return await axios.get(requestUrl);
+      } else {
+        return await axios.get(requestUrl, { params: payload });
       }
     };
 
     try {
       const response = await retryOperation(operation, retries, delay, backoffFactor);
-
       if (!response || response.status !== 200 || !response.data) {
         log(`Unexpected response structure for ${url}`, 'ERROR');
         throw new Error(`Unexpected response status: ${response?.status}`);
@@ -141,61 +162,26 @@ export async function fetchPaginatedData(url, key, options = {}) {
       const dataBatch = Array.isArray(dataKey) ? dataKey : [];
       allData = allData.concat(dataBatch);
 
-      // Log detailed batch info if configured
-      if (logLevel === 'DETAILED') {
-        log(`Fetched ${dataBatch.length} items in this batch. Total fetched: ${allData.length}`, 'INFO');
-      }
-
-      // Pagination continuation logic based on the strategy
       if (useNextKey && response.data.pagination?.next_key) {
         nextKey = response.data.pagination.next_key;
       } else if (!useNextKey && dataBatch.length > 0) {
-        startAfter = dataBatch[dataBatch.length - 1]?.code_id || dataBatch[dataBatch.length - 1]?.id;
-      } else if (paginationType === 'cursor' && response.data.pagination?.cursor) {
-        nextKey = response.data.pagination.cursor;
+        startAfter = dataBatch[dataBatch.length - 1]?.id;
       } else {
-        break; // No more data available
+        break;
       }
 
-      if (dataBatch.length < limit) break; // Last batch fetched
+      if (dataBatch.length < limit) break;
     } catch (error) {
       log(`Error fetching paginated data from ${url}: ${error.message}`, 'ERROR');
-      throw error; // Let the caller handle the error
+      throw error;
     }
   }
 
-  // Log the final count of fetched items for the given query
-  if (logLevel !== 'NONE') {
-    log(`Finished fetching ${allData.length} items for query ${url}`, 'INFO');
-  }
-
+  log(`Finished fetching ${allData.length} items for query ${url}`, 'INFO');
   return allData;
 }
 
-// Contract query function that returns raw response data and status
-export async function sendContractQuery(restAddress, contractAddress, payload) {
-  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
-  const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${encodedPayload}`;
-
-  log(`Attempting to query contract: ${contractAddress}`, 'INFO');
-  log(`Request URL: ${requestUrl}`, 'INFO');
-
-  try {
-    const response = await axios.get(requestUrl);
-    if (response.status === 200) {
-      log(`Successfully queried contract: ${contractAddress}`, 'INFO');
-      return response.data;
-    } else {
-      log(`Unexpected response status: ${response.status}`, 'ERROR');
-      return null;
-    }
-  } catch (error) {
-    log(`Error querying contract: ${error.message}`, 'ERROR');
-    throw error;
-  }
-}
-
-// batchInsert function to handle data insertion with conflict handling
+// Batch insert function to handle data insertion with conflict resolution
 export async function batchInsert(dbRun, tableName, columns, data) {
   if (data.length === 0) {
     log(`No data to insert into ${tableName}. Skipping batch insert.`, 'INFO');
@@ -231,11 +217,11 @@ export async function batchInsert(dbRun, tableName, columns, data) {
     log(`Successfully inserted or updated ${data.length} rows into ${tableName}.`, 'INFO');
   } catch (error) {
     log(`Error performing batch insert into ${tableName}: ${error.message}`, 'ERROR');
-    throw error; // Let the caller handle the error
+    throw error;
   }
 }
 
-// Updated checkProgress to include last_fetched_token
+// Check progress function to track indexer state
 export async function checkProgress(db, step) {
   const dbGet = promisify(db.get).bind(db);
   const sql = `SELECT completed, last_processed, last_fetched_token FROM indexer_progress WHERE step = ?`;
@@ -248,7 +234,7 @@ export async function checkProgress(db, step) {
   }
 }
 
-// Updated updateProgress to handle last_fetched_token
+// Update progress function to record the current state of the indexer
 export async function updateProgress(db, step, completed = 1, lastProcessed = null, lastFetchedToken = null) {
   const dbRun = promisify(db.run).bind(db);
   const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token) VALUES (?, ?, ?, ?)`;
@@ -260,7 +246,7 @@ export async function updateProgress(db, step, completed = 1, lastProcessed = nu
   }
 }
 
-// WebSocket setup function
+// WebSocket setup function to handle real-time communication
 export function setupWebSocket(url, messageHandler, log) {
   const ws = new WebSocket(url);
 
@@ -271,7 +257,7 @@ export function setupWebSocket(url, messageHandler, log) {
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data);
-      messageHandler(message);  // Delegate message handling to the passed handler
+      messageHandler(message);
     } catch (error) {
       log(`Error processing WebSocket message: ${error.message}`);
     }
@@ -279,14 +265,14 @@ export function setupWebSocket(url, messageHandler, log) {
 
   ws.on('close', () => {
     log('WebSocket connection closed. Reconnecting...');
-    setTimeout(() => setupWebSocket(url, messageHandler, log), 5000);  // Reconnect after 5 seconds
+    setTimeout(() => setupWebSocket(url, messageHandler, log), 5000);
   });
 
   ws.on('error', (error) => {
     log(`WebSocket error: ${error.message}`);
   });
 
-  return ws;  // Return the WebSocket instance for external control if needed
+  return ws;
 }
 
 export { promisify } from 'util';
