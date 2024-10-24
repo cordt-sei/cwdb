@@ -1,3 +1,4 @@
+// Import necessary functions and modules
 import { 
   fetchCodeIds, 
   fetchContractAddressesByCodeId,
@@ -15,18 +16,14 @@ import {
   updateProgress 
 } from './utils.js';
 import { config } from './config.js';
-import sqlite3 from 'sqlite3';
+import db from './db.js';  // Assuming db is imported directly from better-sqlite3 setup
 import fs from 'fs';
 
 // Ensure data and logs directories exist
 if (!fs.existsSync('./data')) fs.mkdirSync('./data');
 if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
 
-// Initialize SQLite database
-const db = new sqlite3.Database('./data/indexer.db');
-
-// Create necessary tables if they don't exist
-async function initializeDatabase(db) {
+function initializeDatabase() {
   const createTableStatements = [
     `CREATE TABLE IF NOT EXISTS indexer_progress (
       step TEXT PRIMARY KEY,
@@ -37,7 +34,6 @@ async function initializeDatabase(db) {
     `CREATE TABLE IF NOT EXISTS code_ids (
       code_id TEXT PRIMARY KEY,
       creator TEXT,
-      data_hash TEXT,
       instantiate_permission TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS contracts (
@@ -54,7 +50,8 @@ async function initializeDatabase(db) {
       operation TEXT,
       code_id TEXT,
       updated TEXT,
-      msg TEXT
+      msg TEXT,
+      PRIMARY KEY (contract_address, operation, code_id)
     )`,
     `CREATE TABLE IF NOT EXISTS contract_tokens (
       contract_address TEXT,
@@ -84,19 +81,13 @@ async function initializeDatabase(db) {
   ];
 
   try {
-    for (const statement of createTableStatements) {
-      await new Promise((resolve, reject) => {
-        db.run(statement, (err) => {
-          if (err) {
-            log(`Error creating table: ${err.message}`, 'ERROR');
-            reject(new Error(`Failed to create table: ${statement}`));
-          } else {
-            log(`Table created/verified: ${statement}`, 'INFO');
-            resolve();
-          }
-        });
-      });
-    }
+    const dbInstance = db; // Using better-sqlite3 instance directly
+    dbInstance.transaction(() => {
+      for (const statement of createTableStatements) {
+        dbInstance.prepare(statement).run();
+        log(`Table created/verified: ${statement}`, 'INFO');
+      }
+    })();
     log('All tables initialized successfully.', 'INFO');
   } catch (error) {
     log(`Failed during table initialization: ${error.message}`, 'ERROR');
@@ -108,19 +99,19 @@ async function initializeDatabase(db) {
 async function runIndexer() {
   try {
     log(`Indexer started with log level: ${config.logLevel}`, 'INFO');
-    await initializeDatabase(db);
+    initializeDatabase();
     log('Database initialized successfully.', 'INFO');
 
-    const steps = [
-      { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress, db) },
-      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress, db) },
-      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress, db) },
-      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress, db) },
-      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
-      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress, db) },
-      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi, db) },
-      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress, db) }
-    ];
+const steps = [
+  { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress) },
+  { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
+  { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
+  { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) },
+  { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },
+  { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress) },
+  { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi) },
+  { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress) }
+];
 
     let allStepsCompleted = true;
 
@@ -129,19 +120,21 @@ async function runIndexer() {
       let completed = false;
 
       while (retries > 0 && !completed) {
-        const progress = await checkProgress(db, step.name);
+        const progress = checkProgress(step.name);
         log(`Progress for ${step.name}: completed=${progress.completed}`, 'DEBUG');
 
         if (!progress.completed) {
           log(`Starting step: ${step.name}`, 'INFO');
           try {
+            log(`Executing action for step: ${step.name}`, 'DEBUG');
             await step.action();
-            await updateProgress(db, step.name, 1);
+            updateProgress(step.name, 1);
             log(`Completed step: ${step.name}`, 'INFO');
             completed = true;
           } catch (error) {
             retries--;
             log(`Error during step "${step.name}": ${error.message}. Retries left: ${retries}`, 'ERROR');
+            log(`Stack trace for error in step "${step.name}": ${error.stack}`, 'DEBUG');
             if (retries === 0) {
               allStepsCompleted = false;
               log(`Failed step "${step.name}" after multiple retries.`, 'ERROR');
@@ -150,7 +143,7 @@ async function runIndexer() {
           }
         } else {
           completed = true;
-          log(`Skipping step: ${step.name} (already completed)`, 'DEBUG');
+          log(`Skipping step: ${step.name} (already completed)`, 'INFO');
         }
       }
 
@@ -164,6 +157,7 @@ async function runIndexer() {
     if (allStepsCompleted) {
       log('All indexing steps completed successfully.', 'INFO');
       setupWebSocket(config.wsAddress, handleMessage, log);
+      log('WebSocket setup initiated after successful indexing.', 'INFO');
     } else {
       log('Not all steps were completed successfully. Skipping WebSocket setup.', 'ERROR');
     }

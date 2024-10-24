@@ -1,8 +1,9 @@
+// Import necessary functions and modules
 import { 
   fetchCodeIds, 
   fetchContractAddressesByCodeId, 
   fetchContractMetadata, 
-  fetchContractHistory, 
+  fetchContractHistory,  // Import the new fetchContractHistory function
   identifyContractTypes, 
   fetchTokensAndOwners, 
   fetchPointerData, 
@@ -10,15 +11,18 @@ import {
 } from './contractHelper.js';
 import { 
   log, 
-  updateProgress,
-  promisify
+  updateProgress 
 } from './utils.js';
 import { config } from './config.js';
-import sqlite3 from 'sqlite3';
+import db from './db.js'; // Use the better-sqlite3 instance
+import fs from 'fs';
 
-async function initializeDatabase(db) {
-  const dbRun = promisify(db.run).bind(db);
+// Ensure data and logs directories exist
+if (!fs.existsSync('./data')) fs.mkdirSync('./data');
+if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
 
+// Create necessary tables if they don't exist
+function initializeDatabase() {
   const createTableStatements = [
     `CREATE TABLE IF NOT EXISTS indexer_progress (
       step TEXT PRIMARY KEY,
@@ -29,7 +33,6 @@ async function initializeDatabase(db) {
     `CREATE TABLE IF NOT EXISTS code_ids (
       code_id TEXT PRIMARY KEY,
       creator TEXT,
-      data_hash TEXT,
       instantiate_permission TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS contracts (
@@ -46,7 +49,8 @@ async function initializeDatabase(db) {
       operation TEXT,
       code_id TEXT,
       updated TEXT,
-      msg TEXT
+      msg TEXT,
+      PRIMARY KEY (contract_address, operation, code_id)
     )`,
     `CREATE TABLE IF NOT EXISTS contract_tokens (
       contract_address TEXT,
@@ -76,9 +80,13 @@ async function initializeDatabase(db) {
   ];
 
   try {
-    for (const statement of createTableStatements) {
-      await dbRun(statement);
-    }
+    const dbInstance = db; // Using better-sqlite3 instance directly
+    dbInstance.transaction(() => {
+      for (const statement of createTableStatements) {
+        dbInstance.prepare(statement).run();
+        log(`Table created/verified: ${statement}`, 'INFO');
+      }
+    })();
     log('All tables initialized successfully.', 'INFO');
   } catch (error) {
     log(`Failed during table initialization: ${error.message}`, 'ERROR');
@@ -86,39 +94,47 @@ async function initializeDatabase(db) {
   }
 }
 
+// Main function to run the test indexer
 async function runTest() {
-  const db = new sqlite3.Database('./data/test_indexer.db');
-
   try {
-    // Initialize the database for testing
-    await initializeDatabase(db);
+    log('Test Indexer started with log level: DEBUG', 'INFO');
+    initializeDatabase();
     log('Test database initialized successfully.', 'INFO');
 
-    // Temporary test configuration for code_id "100" only
-    const testCodeId = "100";
-    
-    // Update steps to filter by code_id "100"
+    // Define the steps for the test
     const steps = [
-      { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress, db, [testCodeId]) },
-      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress, db, [testCodeId]) },
-      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress, db) },
-      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress, db) },
-      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress, db) },
-      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress, db) },
-      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi, db) },
-      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress, db) }
+      { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress) },
+      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
+      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
+      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) }, // Added the fetchContractHistory step
+      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },
+      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress) },
+      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi) },
+      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress) }
     ];
 
     // Execute each step sequentially
     for (const step of steps) {
-      try {
-        log(`Running test step: ${step.name}`, 'INFO');
-        await step.action();
-        await updateProgress(db, step.name, 1);
-        log(`Test step ${step.name} completed successfully.`, 'INFO');
-      } catch (error) {
-        log(`Test step ${step.name} failed with error: ${error.message}`, 'ERROR');
-        throw error; // Stop the test if any step fails
+      let retries = 3;
+      let completed = false;
+
+      while (retries > 0 && !completed) {
+        try {
+          log(`Running test step: ${step.name}`, 'INFO');
+          await step.action();
+          updateProgress(step.name, 1);
+          log(`Test step ${step.name} completed successfully.`, 'INFO');
+          completed = true;
+        } catch (error) {
+          retries--;
+          log(`Test step ${step.name} failed with error: ${error.message}. Retries left: ${retries}`, 'ERROR');
+          if (error.stack) {
+            log(`Stack trace: ${error.stack}`, 'DEBUG');
+          }
+          if (retries === 0) {
+            throw error; // Stop the test if retries are exhausted
+          }
+        }
       }
     }
 
@@ -128,12 +144,13 @@ async function runTest() {
     if (error.stack) {
       log(`Stack trace: ${error.stack}`, 'DEBUG');
     }
-  } finally {
-    db.close();
-    log('Test database closed.', 'INFO');
   }
 }
 
+// Start the test
 runTest().catch((error) => {
   log(`Test run failed: ${error.message}`, 'ERROR');
+  if (error.stack) {
+    log(`Stack trace: ${error.stack}`, 'DEBUG');
+  }
 });
