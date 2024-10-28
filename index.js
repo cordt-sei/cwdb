@@ -1,4 +1,5 @@
-// Import necessary functions and modules
+// index.js
+
 import { 
   fetchCodeIds, 
   fetchContractAddressesByCodeId,
@@ -10,13 +11,13 @@ import {
   fetchAssociatedWallets 
 } from './contractHelper.js';
 import { 
-  setupWebSocket, 
+  createWebSocketConnection, 
   log, 
   checkProgress, 
-  updateProgress 
+  updateProgress,
+  db
 } from './utils.js';
 import { config } from './config.js';
-import db from './db.js';  // Assuming db is imported directly from better-sqlite3 setup
 import fs from 'fs';
 
 // Ensure data and logs directories exist
@@ -156,7 +157,7 @@ const steps = [
 
     if (allStepsCompleted) {
       log('All indexing steps completed successfully.', 'INFO');
-      setupWebSocket(config.wsAddress, handleMessage, log);
+      createWebSocketConnection(config.wsAddress, handleMessage, log);
       log('WebSocket setup initiated after successful indexing.', 'INFO');
     } else {
       log('Not all steps were completed successfully. Skipping WebSocket setup.', 'ERROR');

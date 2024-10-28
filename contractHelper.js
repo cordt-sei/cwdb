@@ -7,11 +7,11 @@ import {
   log,
   batchInsertOrUpdate,
   checkProgress,
-  updateProgress
+  updateProgress,
+  db
 } from './utils.js';
 import axios from 'axios';
 import { config } from './config.js';
-import db from './db.js';  // Assuming db is imported directly from the better-sqlite3 setup
 
 // Fetch all code IDs and store them in the database using batch insert and parallel processing
 export async function fetchCodeIds(restAddress) {
@@ -475,3 +475,5 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
       throw error;
   }
 }
+
+export {axios}

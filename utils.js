@@ -1,16 +1,23 @@
 // utils.js
-
+import { axios } from './contractHelper.js';
 import fs from 'fs';
 import path from 'path';
-import axios from 'axios';
-import WebSocket from 'ws';
-import { config } from './config.js';
+import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
+import { config } from './config.js';
+
+// ES module-compatible __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Initialize the SQLite database
-const db = new Database(path.join(__dirname, '../data/indexer.db'));
+const db = new Database(path.join(__dirname, './data/indexer.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
+
+// Export the db instance for use in other modules
+export { db };
+
 
 export function log(message, level = 'INFO') {
   const logLevels = { 'ERROR': 0, 'INFO': 1, 'DEBUG': 2 };

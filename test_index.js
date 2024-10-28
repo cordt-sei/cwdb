@@ -11,10 +11,11 @@ import {
 } from './contractHelper.js';
 import { 
   log, 
-  updateProgress 
+  updateProgress,
+  db
 } from './utils.js';
+
 import { config } from './config.js';
-import db from './db.js'; // Use the better-sqlite3 instance
 import fs from 'fs';
 
 // Ensure data and logs directories exist
