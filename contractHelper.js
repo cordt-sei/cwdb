@@ -13,7 +13,7 @@ import {
 import axios from 'axios';
 import { config } from './config.js';
 
-// Fetch all code IDs and store them in the database using batch insert and parallel processing
+// fetch all code IDs
 export async function fetchCodeIds(restAddress) {
   try {
     const progress = checkProgress('fetchCodeIds');
@@ -28,13 +28,17 @@ export async function fetchCodeIds(restAddress) {
     while (true) {
       let response;
       try {
+        // Ensure nextKey is URL-encoded
+        const encodedNextKey = nextKey ? encodeURIComponent(nextKey) : null;
+
         response = await fetchPaginatedData(
           `${restAddress}/cosmwasm/wasm/v1/code`,
           'code_infos',
           {
             paginationType: 'query',
             useNextKey: true,
-            limit: config.paginationLimit
+            limit: config.paginationLimit,
+            nextKey: encodedNextKey // Properly encode and pass the nextKey
           }
         );
       } catch (error) {
@@ -55,11 +59,13 @@ export async function fetchCodeIds(restAddress) {
 
       log(`Recorded ${batchData.length} code IDs.`, 'INFO');
 
-      if (response.pagination?.next_key) {
-        nextKey = response.pagination.next_key;
-      } else {
-        break;
-      }
+      // Update nextKey for the next iteration
+      nextKey = response.pagination?.next_key || null;
+
+      // Log nextKey for debugging if necessary
+      log(`Next pagination key: ${nextKey}`, 'DEBUG');
+
+      if (!nextKey) break;
 
       updateProgress('fetchCodeIds', 0, response[response.length - 1].code_id);
     }
@@ -103,7 +109,8 @@ export async function fetchContractAddressesByCodeId(restAddress) {
             {
               paginationType: 'query',
               useNextKey: true,
-              limit: config.paginationLimit
+              limit: config.paginationLimit,
+              nextKey: nextKey // Carry forward the nextKey for pagination
             }
           );
         } catch (error) {
@@ -121,11 +128,10 @@ export async function fetchContractAddressesByCodeId(restAddress) {
 
         log(`Recorded ${batchData.length} contracts for ID ${code_id}`, 'DEBUG');
 
-        if (response.pagination?.next_key) {
-          nextKey = response.pagination.next_key;
-        } else {
-          break;
-        }
+        // Update nextKey for the next pagination iteration
+        nextKey = response.pagination?.next_key || null;
+
+        if (!nextKey) break; // Stop if there is no more pagination key
       }
 
       updateProgress('fetchContractsByCode', 0, code_id);

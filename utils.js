@@ -43,13 +43,15 @@ export function log(message, level = 'INFO') {
   if (config.logToFile && level !== 'DEBUG') {
     const logDir = './logs';
     const logFile = path.join(logDir, 'data_collection.log');
-
+  
     // Ensure the logs directory exists
     if (!fs.existsSync(logDir)) {
+      console.log("Creating log directory.");
       fs.mkdirSync(logDir, { recursive: true });
     }
-
-    // Append to the log file
+  
+    // Check if we're reaching the file logging section
+    console.log("Writing log to file:", formattedMessage);
     fs.appendFileSync(logFile, formattedMessage + '\n');
   }
 }
@@ -131,7 +133,9 @@ export async function fetchPaginatedData(url, key, options = {}) {
   log(`Fetching data from: ${url}`, 'INFO');
 
   while (true) {
-    const requestUrl = `${url}?pagination.limit=${limit}${nextKey ? `&pagination.key=${nextKey}` : ''}`;
+    // URL-encode nextKey if it exists
+    const encodedNextKey = nextKey ? encodeURIComponent(nextKey) : '';
+    const requestUrl = `${url}?pagination.limit=${limit}${encodedNextKey ? `&pagination.key=${encodedNextKey}` : ''}`;
 
     log(`Making request to URL: ${requestUrl}`, 'DEBUG');
 
@@ -149,13 +153,15 @@ export async function fetchPaginatedData(url, key, options = {}) {
       const dataBatch = Array.isArray(dataKey) ? dataKey : [];
       allData = allData.concat(dataBatch);
 
-      if (response.data.pagination?.next_key) {
-        nextKey = response.data.pagination.next_key;
-      } else {
-        break;
+      // Update nextKey for the next iteration, if available
+      nextKey = response.data.pagination?.next_key || null;
+
+      if (!nextKey) {
+        log("No further pagination key found; ending pagination.", 'INFO');
+        break; // Exit loop if there's no next_key
       }
 
-      if (dataBatch.length < limit) break;
+      if (dataBatch.length < limit) break; // Exit if fewer results than limit are returned
     } catch (error) {
       log(`Error fetching paginated data from ${url}: ${error.message}`, 'ERROR');
       return allData; // Return what was collected so far

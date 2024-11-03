@@ -9,11 +9,14 @@ export const config = {
   evmRpcAddress: process.env.EVM_RPC_ADDRESS || "http://tasty.seipex.fi:8545",
   pointerApi: process.env.POINTER_API || "https://pointer.basementnodes.ca",
   timeout: parseInt(process.env.TIMEOUT, 10) || 5000,
-  logLevel: process.env.LOG_LEVEL || 'DEBUG', // Logging level: ERROR, INFO, DEBUG
-  logToFile: process.env.LOG_TO_FILE === 'true', // Default to true if explicitly set to true
+  logLevel: 'DEBUG', // Set log level directly or modify as needed
+  logToFile: true, // Directly enable or disable file logging
   retryConfig: {
     retries: parseInt(process.env.RETRY_COUNT, 10) || 3,
     delay: parseInt(process.env.RETRY_DELAY, 10) || 1000,
     backoffFactor: parseFloat(process.env.BACKOFF_FACTOR) || 2
   }
 };
+
+// Temporary debug output to confirm configuration
+console.log(`Logging to file is ${config.logToFile ? 'enabled' : 'disabled'}`);
