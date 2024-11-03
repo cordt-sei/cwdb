@@ -24,34 +24,25 @@ export function log(message, level = 'INFO') {
   const currentLogLevel = config.logLevel || 'INFO';
 
   // Skip logging if the message level is below the current log level
-  if (logLevels[level] > logLevels[currentLogLevel]) {
-    return;
-  }
+  if (logLevels[level] > logLevels[currentLogLevel]) return;
 
-  // Format the log message with the current timestamp and level
+  // Format the log message
   const timestamp = new Date().toISOString();
   const formattedMessage = `[${timestamp}] [${level}] ${message}`;
 
-  // Always log to the console if the level is ERROR, otherwise based on level
-  if (level === 'ERROR' || currentLogLevel === 'DEBUG') {
-    console.log(formattedMessage);
-  } else if (level === 'INFO' && currentLogLevel !== 'ERROR') {
+  // Log to console based on level
+  if (level === 'ERROR' || currentLogLevel === 'DEBUG' || (level === 'INFO' && currentLogLevel !== 'ERROR')) {
     console.log(formattedMessage);
   }
 
-  // Log to file if config.logToFile is true and the level is not DEBUG
+  // Write to file if enabled and not DEBUG level to avoid duplicate log file entries
   if (config.logToFile && level !== 'DEBUG') {
     const logDir = './logs';
     const logFile = path.join(logDir, 'data_collection.log');
-  
-    // Ensure the logs directory exists
-    if (!fs.existsSync(logDir)) {
-      console.log("Creating log directory.");
-      fs.mkdirSync(logDir, { recursive: true });
-    }
-  
-    // Check if we're reaching the file logging section
-    console.log("Writing log to file:", formattedMessage);
+
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    
+    // Log directly to file without additional console confirmation
     fs.appendFileSync(logFile, formattedMessage + '\n');
   }
 }
@@ -80,9 +71,10 @@ export async function retryOperation(operation, retries = 3, delay = 1000, backo
  * @param {string} contractAddress - The contract address to query.
  * @param {Object} payload - The query payload that will be base64 encoded.
  * @param {boolean} usePost - If true, sends the query using a POST request; otherwise, uses GET. Defaults to false.
+ * @param {boolean} skip400ErrorLog - If true, skips logging error for 400 status, used only in identifyContractTypes.
  * @returns {Object} - The parsed response from the contract query, or an error object if the request failed.
  */
-export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false) {
+export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false) {
   // Encode the payload as a base64 string
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
   const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
@@ -96,12 +88,27 @@ export async function sendContractQuery(restAddress, contractAddress, payload, u
       ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload })
       : await axios.get(`${requestUrl}/${encodedPayload}`);
 
-    // Handle a successful response
+    // Handle expected successful response
     if (response.status === 200) {
       log(`Received response for contract ${contractAddress}`, 'DEBUG');
       return response.data; // Return the parsed JSON response
-    } else if ([404, 403, 501, 503].includes(response.status)) {
-      // Log complete failures for these status codes
+    } 
+    
+    // Handle specific cases for 400 error as expected behavior
+    else if (response.status === 400) {
+      if (!skip400ErrorLog) {
+        log(`Expected error 400 received for contract ${contractAddress}`, 'INFO');
+      }
+      if (response.data && response.data.message) {
+        return { error: null, message: response.data.message }; // Return message for type parsing
+      } else {
+        log(`400 error received but no message available in response for contract ${contractAddress}`, 'ERROR');
+        return { error: '400 Error - No message in response' };
+      }
+    }
+
+    // Handle other specific error statuses (e.g., 404, 403, etc.)
+    else if ([404, 403, 501, 503].includes(response.status)) {
       log(`Error querying contract: ${response.status} - ${response.statusText}`, 'ERROR');
       return { error: `Error: ${response.status} - ${response.statusText}` };
     } else {
@@ -129,15 +136,13 @@ export async function fetchPaginatedData(url, key, options = {}) {
 
   let allData = [];
   let nextKey = null;
+  let pageCount = 0; // Track page count to determine if pagination logs are necessary
 
-  log(`Fetching data from: ${url}`, 'INFO');
+  log(`Fetching data for ${url.split('/').pop()}`, 'INFO'); // Simplified to show only the endpoint ID or type
 
   while (true) {
-    // URL-encode nextKey if it exists
     const encodedNextKey = nextKey ? encodeURIComponent(nextKey) : '';
     const requestUrl = `${url}?pagination.limit=${limit}${encodedNextKey ? `&pagination.key=${encodedNextKey}` : ''}`;
-
-    log(`Making request to URL: ${requestUrl}`, 'DEBUG');
 
     const operation = async () => axios.get(requestUrl);
 
@@ -145,34 +150,34 @@ export async function fetchPaginatedData(url, key, options = {}) {
       const response = await retryOperation(operation, retries, delay, backoffFactor);
       if (!response || response.status !== 200 || !response.data) {
         log(`Unexpected response structure for ${url}`, 'ERROR');
-        return allData; // Return what was collected so far
+        return allData;
       }
 
-      log(`Received response data: ${JSON.stringify(response.data)}`, 'DEBUG');
-      const dataKey = response.data[key];
-      const dataBatch = Array.isArray(dataKey) ? dataKey : [];
+      const dataBatch = Array.isArray(response.data[key]) ? response.data[key] : [];
       allData = allData.concat(dataBatch);
 
-      // Update nextKey for the next iteration, if available
+      pageCount += 1;
       nextKey = response.data.pagination?.next_key || null;
 
-      if (!nextKey) {
-        log("No further pagination key found; ending pagination.", 'INFO');
-        break; // Exit loop if there's no next_key
+      if (!nextKey) break; // Stop if no next_key is present
+
+      // Only log pagination if multiple pages are encountered
+      if (pageCount > 1) {
+        log(`Fetching additional page (${pageCount}) for ${url.split('/').pop()}`, 'INFO');
       }
 
-      if (dataBatch.length < limit) break; // Exit if fewer results than limit are returned
+      if (dataBatch.length < limit) break;
     } catch (error) {
       log(`Error fetching paginated data from ${url}: ${error.message}`, 'ERROR');
-      return allData; // Return what was collected so far
+      return allData;
     }
   }
 
-  log(`Finished fetching ${allData.length} items for query ${url}`, 'INFO');
+  log(`Fetched ${allData.length} items for ${url.split('/').pop()}`, 'INFO'); // Final count log
   return allData;
 }
 
-// Helper function to batch database operations with intelligent handling for updates
+// Helper function to batch database operations
 export function batchInsertOrUpdate(tableName, columns, values, uniqueColumn) {
   if (!Array.isArray(values) || values.length === 0) {
     log('No values provided for batch insertion or update.', 'DEBUG');
@@ -189,15 +194,25 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumn) {
     for (const row of rows) {
       try {
         const uniqueValue = row[columns.indexOf(uniqueColumn)];
+
+        // Convert `msg` JSON to a safely escapable string if it exists in columns
+        const sanitizedRow = row.map((val, idx) => {
+          if (columns[idx] === 'msg' && typeof val === 'string') {
+            return JSON.stringify(val); // Safely handle JSON strings
+          }
+          return val !== null ? val : 'NULL';
+        });
+        
+        log(`Processing row: ${sanitizedRow}`, 'DEBUG');
+
+        // Check for an existing row based on the unique column value
         const existingRow = db.prepare(`SELECT * FROM ${tableName} WHERE ${uniqueColumn} = ?`).get(uniqueValue);
 
         if (existingRow) {
-          // Update the existing row if necessary
-          update.run([...row, uniqueValue]);
+          update.run([...sanitizedRow, uniqueValue]);
           log(`Updated row in ${tableName} where ${uniqueColumn} = ${uniqueValue}`, 'DEBUG');
         } else {
-          // Insert new row
-          insert.run(row);
+          insert.run(sanitizedRow);
           log(`Inserted new row into ${tableName}`, 'DEBUG');
         }
       } catch (error) {

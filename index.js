@@ -103,16 +103,16 @@ async function runIndexer() {
     initializeDatabase();
     log('Database initialized successfully.', 'INFO');
 
-const steps = [
-  { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress) },
-  { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
-  { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
-  { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) },
-  { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },
-  { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress) },
-  { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi) },
-  { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress) }
-];
+    const steps = [
+      { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress) },
+      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
+      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
+      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) },
+      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },
+      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress) },
+      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi) },
+      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress) }
+    ];
 
     let allStepsCompleted = true;
 

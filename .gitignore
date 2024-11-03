@@ -8,6 +8,8 @@ node_modules/
 *.db
 *.journal
 *.db-journal
+*.db-shm
+*.db-wal
 
 # Environment files
 .env

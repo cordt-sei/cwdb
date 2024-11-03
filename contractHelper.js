@@ -9,6 +9,7 @@ import {
   db
 } from './utils.js';
 import axios from 'axios';
+import pLimit from 'p-limit';
 import { config } from './config.js';
 
 // fetch all code IDs
@@ -21,7 +22,8 @@ export async function fetchCodeIds(restAddress) {
     }
 
     let nextKey = null;
-    let allCodeInfos = [];
+    let totalRecorded = 0;
+    let batchCount = 0; // Track the number of batches for clearer pagination context
 
     while (true) {
       const response = await fetchPaginatedData(
@@ -37,7 +39,7 @@ export async function fetchCodeIds(restAddress) {
       );
 
       if (!Array.isArray(response) || response.length === 0) {
-        log('All code IDs recorded.', 'INFO');
+        log('All code IDs recorded; no additional data found.', 'INFO');
         break;
       }
 
@@ -45,21 +47,30 @@ export async function fetchCodeIds(restAddress) {
         [code_id, creator, JSON.stringify(instantiate_permission)]
       );
 
+      // Batch insert and log each processed batch
       db.transaction(() => {
         batchInsertOrUpdate('code_ids', ['code_id', 'creator', 'instantiate_permission'], batchData, 'code_id');
       })();
 
-      allCodeInfos = allCodeInfos.concat(response);
-      log(`Recorded ${batchData.length} code IDs.`, 'INFO');
+      batchCount += 1;
+      totalRecorded += batchData.length;
+
+      log(`Batch ${batchCount}: Recorded ${batchData.length} code IDs.`, 'INFO');
 
       nextKey = response.pagination?.next_key || null;
-      if (!nextKey) break;
+      if (!nextKey) {
+        log('No further pagination key found; pagination ended.', 'INFO');
+        break;
+      } else {
+        log(`Pagination continues; moving to the next page for code IDs.`, 'INFO');
+      }
 
       updateProgress('fetchCodeIds', 0, response[response.length - 1].code_id);
     }
 
-    if (allCodeInfos.length > 0) {
-      log(`Total code IDs fetched and stored: ${allCodeInfos.length}`, 'INFO');
+    // Final log for total number of code IDs recorded
+    if (totalRecorded > 0) {
+      log(`Total code IDs fetched and stored: ${totalRecorded}`, 'INFO');
       updateProgress('fetchCodeIds', 1);
     } else {
       log('No new code IDs recorded.', 'INFO');
@@ -70,7 +81,7 @@ export async function fetchCodeIds(restAddress) {
   }
 }
 
-// Fetch contract addresses by code and store them in the database
+// fetchContractAddressesByCodeId
 export async function fetchContractAddressesByCodeId(restAddress) {
   try {
     const progress = checkProgress('fetchContractsByCode');
@@ -81,68 +92,81 @@ export async function fetchContractAddressesByCodeId(restAddress) {
 
     const codeIds = db.prepare('SELECT code_id FROM code_ids').all().map(row => row.code_id);
     const startIndex = progress.last_processed ? codeIds.indexOf(progress.last_processed) + 1 : 0;
+    const limit = pLimit(config.concurrencyLimit);
+    let totalContracts = 0;
 
-    for (let i = startIndex; i < codeIds.length; i++) {
-      const code_id = codeIds[i];
+    const fetchPromises = codeIds.slice(startIndex).map(code_id => limit(async () => {
+      log(`Fetching contracts for code_id ${code_id}`, 'INFO');
+
+      let allContracts = [];
       let nextKey = null;
-
-      log(`Getting contracts for ID ${code_id}`, 'INFO');
+      let page = 1;
 
       while (true) {
-        const response = await fetchPaginatedData(
-          `${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts`,
-          'contracts',
-          {
-            limit: config.paginationLimit,
-            nextKey,
-            retries: config.retryConfig.retries,
-            delay: config.retryConfig.delay,
-            backoffFactor: config.retryConfig.backoffFactor,
-          }
-        );
+        const paginatedUrl = `${restAddress}/cosmwasm/wasm/v1/code/${code_id}/contracts${nextKey ? `?pagination.key=${encodeURIComponent(nextKey)}` : ''}`;
+        log(`Fetching data for code_id ${code_id}, page ${page}`, 'DEBUG');
 
-        if (!Array.isArray(response) || response.length === 0) {
-          log(`No contracts found for ID ${code_id}`, 'INFO');
+        const response = await fetchPaginatedData(paginatedUrl, 'contracts', {
+          limit: config.paginationLimit,
+          retries: config.retryConfig.retries,
+          delay: config.retryConfig.delay,
+          backoffFactor: config.retryConfig.backoffFactor,
+        });
+
+        if (response.length > 0) {
+          allContracts.push(...response);
+          log(`Fetched ${response.length} items for code_id ${code_id} on page ${page}`, 'DEBUG');
+        } else {
+          log(`No more contracts found for code_id ${code_id} on page ${page}`, 'INFO');
           break;
         }
 
-        const batchData = response.map(contractAddress => [code_id, contractAddress, null]);
-        batchInsertOrUpdate('contracts', ['code_id', 'address', 'type'], batchData, 'address');
-
-        log(`Recorded ${batchData.length} contracts for ID ${code_id}`, 'DEBUG');
+        if (response.length < config.paginationLimit) break;
         nextKey = response.pagination?.next_key || null;
-
         if (!nextKey) break;
+        page += 1;
+      }
+
+      const contractCount = allContracts.length;
+      totalContracts += contractCount;
+
+      if (contractCount > 0) {
+        const batchData = allContracts.map(addr => [code_id, addr, null]);
+        await batchInsertOrUpdate('contracts', ['code_id', 'address', 'type'], batchData, 'address');
+        log(`Recorded ${contractCount} contracts for code_id ${code_id}`, 'INFO');
+      } else {
+        log(`No contracts found for code_id ${code_id}`, 'INFO');
       }
 
       updateProgress('fetchContractsByCode', 0, code_id);
-    }
+    }));
 
+    await Promise.allSettled(fetchPromises);
     updateProgress('fetchContractsByCode', 1);
-    log('Finished fetching and storing contract addresses for all code IDs.', 'INFO');
+    log(`Completed fetching contract addresses for all code IDs. Total contracts recorded: ${totalContracts}`, 'INFO');
   } catch (error) {
     log(`Error in fetchContractAddressesByCodeId: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Fetch contract history for each contract address
+// Fetch contract history for each contract address concurrently
 export async function fetchContractHistory(restAddress) {
   try {
     const contracts = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
-    for (const contractAddress of contracts) {
-      let nextKey = null;
+    const limit = pLimit(config.concurrencyLimit);
 
+    const historyPromises = contracts.map(contractAddress => limit(async () => {
       log(`Fetching contract history for ${contractAddress}`, 'INFO');
+      let nextKey = null;
 
       while (true) {
         const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/history`;
         const requestUrl = nextKey ? `${url}?pagination.key=${encodeURIComponent(nextKey)}` : url;
 
-        const response = await retryOperation(async () => axios.get(requestUrl));
-
-        if (response?.status !== 200 || !response.data) {
-          log(`Failed to fetch contract history for ${contractAddress}. Status: ${response?.status}`, 'ERROR');
+        const response = await retryOperation(() => axios.get(requestUrl));
+        if (!response || response.status !== 200 || !response.data) {
+          log(`Failed to fetch history for ${contractAddress}. Status: ${response?.status}`, 'ERROR');
           break;
         }
 
@@ -152,117 +176,166 @@ export async function fetchContractHistory(restAddress) {
           break;
         }
 
+        // Prepare data for batch insert with proper escaping for SQLite
         const insertData = entries.map(entry => [
           contractAddress,
-          entry.operation,
-          entry.code_id,
-          entry.updated,
-          JSON.stringify(entry.msg)
+          entry.operation || '', // Handle nulls with fallback
+          entry.code_id || '',   // Handle nulls with fallback
+          entry.updated || '',   // Handle nulls with fallback
+          JSON.stringify(entry.msg).replace(/"/g, '""').replace(/\\/g, '\\\\') // Double escape quotes and backslashes
         ]);
 
-        db.transaction(() => {
-          const insertStmt = db.prepare(`
-            INSERT OR REPLACE INTO contract_history 
-            (contract_address, operation, code_id, updated, msg) 
-            VALUES (?, ?, ?, ?, ?)
-          `);
-          insertData.forEach(data => insertStmt.run(data));
-        })();
+        try {
+          await batchInsertOrUpdate(
+            'contract_history',
+            ['contract_address', 'operation', 'code_id', 'updated', 'msg'],
+            insertData,
+            'contract_address'
+          );
+          log(`Inserted ${entries.length} history entries for ${contractAddress}`, 'DEBUG');
+        } catch (dbError) {
+          log(`Error inserting history for ${contractAddress}: ${dbError.message}`, 'ERROR');
+          log(`Insert data: ${JSON.stringify(insertData)}`, 'ERROR'); // Log insert data for debugging
+        }
 
-        log(`Inserted ${entries.length} history entries for ${contractAddress}`, 'INFO');
         nextKey = pagination?.next_key || null;
-
         if (!nextKey) break;
       }
-    }
+    }));
+
+    await Promise.allSettled(historyPromises);
     log('Completed fetching contract history for all contracts.', 'INFO');
   } catch (error) {
-    log(`Failed in fetchContractHistory: ${error.message}`, 'ERROR');
+    log(`Error in fetchContractHistory: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Fetch and store metadata for each contract address
+// Fetch and store metadata for each contract address in concurrent batches
 export async function fetchContractMetadata(restAddress) {
-  const batchSize = 5;
+  const batchSize = 50;  // Using 50 as a reasonable batch size
   const delayBetweenBatches = 100;
 
   try {
+    // Check the current progress for this step
     const progress = checkProgress('fetchContractMetadata');
     if (progress.completed) {
       log('Skipping fetchContractMetadata: Already completed', 'INFO');
       return;
     }
 
+    // Fetch all contract addresses and determine the starting point
     const contractAddresses = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
+    const totalContracts = contractAddresses.length;
     const startIndex = progress.last_processed ? contractAddresses.indexOf(progress.last_processed) + 1 : 0;
 
-    for (let i = startIndex; i < contractAddresses.length; i += batchSize) {
+    log(`Starting fetchContractMetadata for ${totalContracts} total contracts. Resuming from index ${startIndex}.`, 'INFO');
+
+    for (let i = startIndex; i < totalContracts; i += batchSize) {
       const batch = contractAddresses.slice(i, i + batchSize);
-      const fetchPromises = batch.map(async contractAddress => {
+      const limit = pLimit(config.concurrencyLimit);
+
+      const fetchPromises = batch.map(contractAddress => limit(async () => {
         try {
           const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`;
           const response = await retryOperation(() => axios.get(url));
 
-          if (response.status === 200 && response.data?.contract_info) {
+          if (response?.status === 200 && response.data?.contract_info) {
             const { code_id, creator, admin, label } = response.data.contract_info;
             return [contractAddress, code_id, creator, admin, label];
-          } else {
-            log(`Unexpected response status ${response.status} for contract ${contractAddress}`, 'DEBUG');
           }
         } catch (error) {
-          log(`Failed to fetch contract info for ${contractAddress}: ${error.message}`, 'ERROR');
+          log(`Failed to fetch metadata for ${contractAddress}: ${error.message}`, 'ERROR');
         }
         return null;
-      });
+      }));
 
-      const results = (await Promise.all(fetchPromises)).filter(Boolean);
+      const results = (await Promise.all(fetchPromises)).filter(Boolean); // Filter out any null results
+
       if (results.length > 0) {
-        batchInsertOrUpdate('contracts', ['address', 'code_id', 'creator', 'admin', 'label'], results, 'address');
-        log(`Batch inserted metadata for ${results.length} contracts`, 'DEBUG');
+        await batchInsertOrUpdate('contracts', ['address', 'code_id', 'creator', 'admin', 'label'], results, 'address');
+        log(`Batch inserted metadata for ${results.length} contracts (${i + results.length} out of ${totalContracts})`, 'INFO');
+      } else {
+        log(`No valid metadata found for batch starting with contract ${batch[0]}`, 'INFO');
       }
 
-      updateProgress('fetchContractMetadata', 0, batch[batch.length - 1]);
-      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+      // Update progress with the last processed contract address
+      await updateProgress('fetchContractMetadata', 0, batch[batch.length - 1]);
+      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches)); // Throttle between batches
     }
 
-    updateProgress('fetchContractMetadata', 1);
-    log('Finished processing metadata for all contracts.', 'INFO');
+    // Mark the step as completed after processing all contracts
+    await updateProgress('fetchContractMetadata', 1);
+    log(`Finished processing metadata for all ${totalContracts} contracts.`, 'INFO');
   } catch (error) {
     log(`Error in fetchContractMetadata: ${error.message}`, 'ERROR');
     throw error;
   }
 }
 
-// Identify contract types and store them in the database
+// Identify contract types concurrently with batch inserts and progress logging
 export async function identifyContractTypes(restAddress) {
   try {
     const contracts = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
+    const limit = pLimit(config.concurrencyLimit);
+    const batchSize = 50; // Define batch size for database inserts
+    let batchResults = []; // Temporary storage for batch inserts
+    let processedCount = 0; // Counter for progress tracking
+    const totalContracts = contracts.length; // Total contracts for progress tracking
 
-    for (const contractAddress of contracts) {
+    // Retrieve progress to start from where it left off, if applicable
+    const progress = checkProgress('identifyContractTypes');
+    const startIndex = progress.last_processed ? contracts.indexOf(progress.last_processed) + 1 : 0;
+
+    // Process contracts with concurrency limit
+    const typePromises = contracts.slice(startIndex).map(contractAddress => limit(async () => {
       let contractType = 'other';
       const testPayload = { "a": "b" };
 
       try {
-        const response = await sendContractQuery(restAddress, contractAddress, testPayload);
+        // Send query to identify contract type, skip logging 400 errors
+        const response = await sendContractQuery(restAddress, contractAddress, testPayload, true, true);
 
-        if (response && response.message) {
+        if (response?.message) {
           const match = response.message.match(/Error parsing into type (\S+)::/);
           if (match) {
             contractType = match[1];
             log(`Identified contract type for ${contractAddress}: ${contractType}`, 'INFO');
-          } else {
-            log(`Unable to extract contract type for ${contractAddress} from 400 response`, 'DEBUG');
           }
         }
 
-        batchInsertOrUpdate('contracts', ['address', 'type'], [[contractAddress, contractType]], 'address');
+        // Add identified type to batch results
+        batchResults.push([contractAddress, contractType]);
+        processedCount++;
+
+        // Insert batch into database when batch size is reached
+        if (batchResults.length >= batchSize) {
+          await batchInsertOrUpdate('contracts', ['address', 'type'], batchResults, 'address');
+          log(`Batch inserted contract types for ${batchResults.length} contracts`, 'DEBUG');
+          batchResults.length = 0; // Clear batch after inserting
+          await updateProgress('identifyContractTypes', 0, contractAddress); // Update progress in DB
+        }
+
+        // Log progress periodically
+        if (processedCount % 100 === 0 || processedCount === totalContracts) {
+          log(`Progress: Processed ${processedCount} / ${totalContracts} contracts`, 'INFO');
+        }
       } catch (error) {
         log(`Error determining contract type for ${contractAddress}: ${error.message}`, 'ERROR');
       }
+    }));
+
+    await Promise.allSettled(typePromises);
+
+    // Insert any remaining results in the batchResults array
+    if (batchResults.length > 0) {
+      await batchInsertOrUpdate('contracts', ['address', 'type'], batchResults, 'address');
+      log(`Final batch inserted contract types for ${batchResults.length} contracts`, 'DEBUG');
     }
 
-    log('Finished identifying contract types.', 'INFO');
+    // Mark the step as completed in the database
+    await updateProgress('identifyContractTypes', 1); // Final status update in DB
+    log(`Finished identifying contract types for all ${totalContracts} contracts.`, 'INFO');
   } catch (error) {
     log(`Error in identifyContractTypes: ${error.message}`, 'ERROR');
     throw error;
@@ -272,6 +345,8 @@ export async function identifyContractTypes(restAddress) {
 // Fetch tokens and their owners for relevant contracts
 export async function fetchTokensAndOwners(restAddress) {
   const delayBetweenBatches = 100;
+  const concurrencyLimit = config.concurrencyLimit || 5; // Max concurrent ownership requests
+  const limit = pLimit(concurrencyLimit);
 
   try {
     const progress = checkProgress('fetchTokensAndOwners');
@@ -284,6 +359,9 @@ export async function fetchTokensAndOwners(restAddress) {
       let ownershipData = [];
       let lastTokenFetched = null;
 
+      log(`Fetching tokens for contract ${contractAddress}`, 'INFO');
+
+      // Paginated token fetch loop
       while (true) {
         const tokenQueryPayload = {
           all_tokens: {
@@ -298,26 +376,24 @@ export async function fetchTokensAndOwners(restAddress) {
           const tokenIds = response.tokens;
           allTokens.push(...tokenIds);
           lastTokenFetched = tokenIds[tokenIds.length - 1];
+          log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Total: ${allTokens.length}`, 'DEBUG');
 
-          log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Total: ${allTokens.length}`, 'INFO');
-
+          // Ownership lookup for each token in parallel
           if (/721|1155/i.test(contractType)) {
-            const ownershipPromises = tokenIds.map(async tokenId => {
+            const ownershipPromises = tokenIds.map(tokenId => limit(async () => {
               const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
-              const ownerResponse = await retryOperation(() => sendContractQuery(
-                restAddress,
-                contractAddress,
-                ownerQueryPayload
-              ));
+              const ownerResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, ownerQueryPayload));
 
               if (ownerResponse?.owner) {
                 ownershipData.push([contractAddress, tokenId, ownerResponse.owner, contractType]);
                 log(`Fetched ownership for token ${tokenId}: owner is ${ownerResponse.owner}`, 'DEBUG');
               }
-            });
-            await Promise.allSettled(ownershipPromises);
+            }));
+
+            await Promise.allSettled(ownershipPromises); // Wait for all ownership fetches for current tokens
           }
 
+          // Break out if fewer tokens than the limit were fetched, indicating the last page
           if (tokenIds.length < config.paginationLimit) break;
         } else {
           log(`No more tokens found for contract ${contractAddress}`, 'INFO');
@@ -326,6 +402,7 @@ export async function fetchTokensAndOwners(restAddress) {
       }
 
       if (allTokens.length > 0) {
+        // Batch insert token IDs and ownership data
         await batchInsertOrUpdate('contracts', ['address', 'token_ids'], [[contractAddress, allTokens.join(',')]], 'address');
         log(`Updated token_ids for ${contractAddress}`, 'INFO');
 
@@ -339,10 +416,12 @@ export async function fetchTokensAndOwners(restAddress) {
         }
       }
 
-      updateProgress('fetchTokensAndOwners', 0, contractAddress, lastTokenFetched);
-      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+      // Update progress to avoid re-fetching on restart
+      await updateProgress('fetchTokensAndOwners', 0, contractAddress, lastTokenFetched);
+      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches)); // Delay to manage API rate limits
     }
 
+    updateProgress('fetchTokensAndOwners', 1); // Mark progress as complete
     log('Finished processing tokens and ownership for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchTokensAndOwners: ${error.message}`, 'ERROR');
