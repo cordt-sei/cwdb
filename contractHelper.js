@@ -443,22 +443,34 @@ export async function fetchTokensAndOwners(restAddress) {
 }
 
 // Fetch pointer data and store it in the database
-export async function fetchPointerData(pointerApi, contractAddresses, chunkSize = 10) {
-  // Check if contractAddresses is a valid array
+export async function fetchPointerData(pointerApi) {
+  const chunkSize = config.chunkSize || 25; // Default to 10 if chunkSize is not defined in config
+
+  // Retrieve all contract addresses from the contracts table
+  const contractAddresses = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
+
+  // Check if contractAddresses is valid
   if (!Array.isArray(contractAddresses) || contractAddresses.length === 0) {
-    log(`Error: 'contractAddresses' is either undefined or not an array`, 'ERROR');
-    return; // Exit function if contractAddresses is invalid
+    log(`Error: No contract addresses found in the database`, 'ERROR');
+    return; // Exit function if no addresses are found
   }
+
+  // Insert contract addresses into the pointer_data table if not already present
+  await db.transaction(() => {
+    const insertQuery = db.prepare(`
+      INSERT OR IGNORE INTO pointer_data (contract_address) VALUES (?)`);
+    contractAddresses.forEach(address => insertQuery.run(address));
+  })();
 
   for (let i = 0; i < contractAddresses.length; i += chunkSize) {
     const chunk = contractAddresses.slice(i, i + chunkSize); // Get a chunk of addresses for each batch
     const payload = { addresses: chunk }; // Prepare payload
 
     try {
-      // Send the batch request to the pointer API
+      // Send the batch request to the pointer API with retry logic
       const response = await retryOperation(() => axios.post(pointerApi, payload));
 
-      if (response.status === 200 && Array.isArray(response.data)) {
+      if (response && response.status === 200 && Array.isArray(response.data)) {
         // Parse the response to extract necessary fields for each address
         const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer, pointerType }) => [
           address,
@@ -470,10 +482,15 @@ export async function fetchPointerData(pointerApi, contractAddresses, chunkSize 
         ]);
 
         // Insert the batch data into the database
-        await batchInsertOrUpdate('pointer_data', ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer', 'pointer_type'], batchData, 'contract_address');
+        await batchInsertOrUpdate(
+          'pointer_data',
+          ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer', 'pointer_type'],
+          batchData,
+          'contract_address'
+        );
         log(`Stored pointer data for ${batchData.length} addresses`, 'DEBUG');
       } else {
-        log(`Unexpected or empty data while fetching pointer data. Status: ${response.status}`, 'ERROR');
+        log(`Unexpected or empty data while fetching pointer data. Status: ${response ? response.status : 'No response'}`, 'ERROR');
       }
     } catch (error) {
       log(`Error processing pointer data chunk: ${error.message}`, 'ERROR');
