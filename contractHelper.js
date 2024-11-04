@@ -298,13 +298,13 @@ export async function identifyContractTypes(restAddress) {
           log(`Debug: Full error message for ${contractAddress}: ${response.message}`, 'DEBUG');
           
           // Attempt to extract the contract type from the error message, if available
-          const match = response.message.match(/Error parsing into type ([\w:]+)::/);
+          const match = response.message.match(/Error parsing into type ([\w]+)::/);
           if (match) {
-            contractType = match[1]; // Extract contract type from the error message
+            contractType = match[1]; // Capture only the base type
             log(`Identified contract type for ${contractAddress}: ${contractType}`, 'INFO');
           } else {
             log(`No recognizable type in error message for contract ${contractAddress}`, 'INFO');
-          }
+          }          
         } else {
           log(`No 'message' field in response for contract ${contractAddress}`, 'DEBUG');
         }
