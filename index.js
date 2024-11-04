@@ -105,7 +105,7 @@ async function runIndexer() {
 
     const steps = [
       { name: 'fetchCodeIds', action: () => fetchCodeIds(config.restAddress) },
-      { name: 'fetchContractAddressesByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
+      { name: 'fetchContractsByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
       { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
       { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) },
       { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },

@@ -10,7 +10,7 @@ export const config = {
   evmRpcAddress: "http://tasty.seipex.fi:8545",
   pointerApi: "https://pointer.basementnodes.ca",
   timeout: 5000,
-  logLevel: 'INFO',
+  logLevel: 'DEBUG',
   logToFile: true,
   retryConfig: {
     retries: 3,

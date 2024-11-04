@@ -81,12 +81,12 @@ export async function fetchCodeIds(restAddress) {
   }
 }
 
-// fetchContractAddressesByCodeId
+// fetchContractAddressesByCodeId with unified progress tracking identifier
 export async function fetchContractAddressesByCodeId(restAddress) {
   try {
-    const progress = checkProgress('fetchContractsByCode');
+    const progress = checkProgress('fetchContractsByCode');  // Unified identifier
     if (progress.completed) {
-      log('Skipping fetchContractAddressesByCodeId: Already completed', 'INFO');
+      log('Skipping fetchContractsByCode: Already completed', 'INFO');
       return;
     }
 
@@ -138,11 +138,11 @@ export async function fetchContractAddressesByCodeId(restAddress) {
         log(`No contracts found for code_id ${code_id}`, 'INFO');
       }
 
-      updateProgress('fetchContractsByCode', 0, code_id);
+      updateProgress('fetchContractsByCode', 0, code_id);  // Unified identifier
     }));
 
     await Promise.allSettled(fetchPromises);
-    updateProgress('fetchContractsByCode', 1);
+    updateProgress('fetchContractsByCode', 1);  // Unified identifier
     log(`Completed fetching contract addresses for all code IDs. Total contracts recorded: ${totalContracts}`, 'INFO');
   } catch (error) {
     log(`Error in fetchContractAddressesByCodeId: ${error.message}`, 'ERROR');
@@ -277,65 +277,78 @@ export async function fetchContractMetadata(restAddress) {
 export async function identifyContractTypes(restAddress) {
   try {
     const contracts = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
-    const limit = pLimit(config.concurrencyLimit);
-    const batchSize = 50; // Define batch size for database inserts
-    let batchResults = []; // Temporary storage for batch inserts
-    let processedCount = 0; // Counter for progress tracking
-    const totalContracts = contracts.length; // Total contracts for progress tracking
-
-    // Retrieve progress to start from where it left off, if applicable
     const progress = checkProgress('identifyContractTypes');
     const startIndex = progress.last_processed ? contracts.indexOf(progress.last_processed) + 1 : 0;
+    const batchSize = 50;
+    let batchData = [];
+    let processedCount = 0;
 
-    // Process contracts with concurrency limit
+    const limit = pLimit(config.concurrencyLimit);
+
     const typePromises = contracts.slice(startIndex).map(contractAddress => limit(async () => {
-      let contractType = 'other';
-      const testPayload = { "a": "b" };
+      let contractType;
+      const testPayload = { "a": "b" }; // Intentionally incorrect payload to trigger an error response
 
       try {
-        // Send query to identify contract type, skip logging 400 errors
-        const response = await sendContractQuery(restAddress, contractAddress, testPayload, true, true);
+        // Send a query to check the contract type
+        const response = await sendContractQuery(restAddress, contractAddress, testPayload, false, true);
 
+        // Log the entire response message for debugging purposes
         if (response?.message) {
-          const match = response.message.match(/Error parsing into type (\S+)::/);
+          log(`Debug: Full error message for ${contractAddress}: ${response.message}`, 'DEBUG');
+          
+          // Attempt to extract the contract type from the error message, if available
+          const match = response.message.match(/Error parsing into type ([\w:]+)::/);
           if (match) {
-            contractType = match[1];
+            contractType = match[1]; // Extract contract type from the error message
             log(`Identified contract type for ${contractAddress}: ${contractType}`, 'INFO');
+          } else {
+            log(`No recognizable type in error message for contract ${contractAddress}`, 'INFO');
           }
+        } else {
+          log(`No 'message' field in response for contract ${contractAddress}`, 'DEBUG');
         }
 
-        // Add identified type to batch results
-        batchResults.push([contractAddress, contractType]);
+        // If no contract type was identified, set to 'unknown'
+        if (!contractType) {
+          log(`Unexpected format for contract ${contractAddress}. Full response: ${JSON.stringify(response)}`, 'DEBUG');
+          contractType = 'unknown';
+        }
+
+        // Add to batch data
+        batchData.push([contractAddress, contractType]);
         processedCount++;
 
-        // Insert batch into database when batch size is reached
-        if (batchResults.length >= batchSize) {
-          await batchInsertOrUpdate('contracts', ['address', 'type'], batchResults, 'address');
-          log(`Batch inserted contract types for ${batchResults.length} contracts`, 'DEBUG');
-          batchResults.length = 0; // Clear batch after inserting
-          await updateProgress('identifyContractTypes', 0, contractAddress); // Update progress in DB
+        // Insert batch data when reaching batch size
+        if (batchData.length >= batchSize) {
+          await batchInsertOrUpdate('contracts', ['address', 'type'], batchData, 'address');
+          batchData = []; // Clear batch after insert
+          await updateProgress('identifyContractTypes', 0, contractAddress); // Update last processed contract
         }
 
-        // Log progress periodically
-        if (processedCount % 100 === 0 || processedCount === totalContracts) {
-          log(`Progress: Processed ${processedCount} / ${totalContracts} contracts`, 'INFO');
+        // Periodic logging for every 100 contracts or at completion
+        if (processedCount % 100 === 0 || processedCount === contracts.length) {
+          log(`Progress: Processed ${processedCount} / ${contracts.length} contracts`, 'INFO');
         }
       } catch (error) {
-        log(`Error determining contract type for ${contractAddress}: ${error.message}`, 'ERROR');
+        // Log any unexpected errors that aren't related to type parsing
+        if (error?.response?.status !== 400) {
+          log(`Error determining contract type for ${contractAddress}: ${error.message}`, 'ERROR');
+        }
       }
     }));
 
     await Promise.allSettled(typePromises);
 
-    // Insert any remaining results in the batchResults array
-    if (batchResults.length > 0) {
-      await batchInsertOrUpdate('contracts', ['address', 'type'], batchResults, 'address');
-      log(`Final batch inserted contract types for ${batchResults.length} contracts`, 'DEBUG');
+    // Insert remaining contracts if any are left in the batch
+    if (batchData.length > 0) {
+      await batchInsertOrUpdate('contracts', ['address', 'type'], batchData, 'address');
+      log(`Final batch inserted contract types for ${batchData.length} contracts`, 'DEBUG');
     }
 
-    // Mark the step as completed in the database
-    await updateProgress('identifyContractTypes', 1); // Final status update in DB
-    log(`Finished identifying contract types for all ${totalContracts} contracts.`, 'INFO');
+    // Mark the step as completed
+    await updateProgress('identifyContractTypes', 1); 
+    log(`Finished identifying contract types for all contracts.`, 'INFO');
   } catch (error) {
     log(`Error in identifyContractTypes: ${error.message}`, 'ERROR');
     throw error;
@@ -429,16 +442,24 @@ export async function fetchTokensAndOwners(restAddress) {
   }
 }
 
-// Helper function to process pointer data
+// Fetch pointer data and store it in the database
 export async function fetchPointerData(pointerApi, contractAddresses, chunkSize = 10) {
+  // Check if contractAddresses is a valid array
+  if (!Array.isArray(contractAddresses) || contractAddresses.length === 0) {
+    log(`Error: 'contractAddresses' is either undefined or not an array`, 'ERROR');
+    return; // Exit function if contractAddresses is invalid
+  }
+
   for (let i = 0; i < contractAddresses.length; i += chunkSize) {
-    const chunk = contractAddresses.slice(i, i + chunkSize);
-    const payload = { addresses: chunk };
-    
+    const chunk = contractAddresses.slice(i, i + chunkSize); // Get a chunk of addresses for each batch
+    const payload = { addresses: chunk }; // Prepare payload
+
     try {
+      // Send the batch request to the pointer API
       const response = await retryOperation(() => axios.post(pointerApi, payload));
-      
+
       if (response.status === 200 && Array.isArray(response.data)) {
+        // Parse the response to extract necessary fields for each address
         const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer, pointerType }) => [
           address,
           pointerAddress || null,
@@ -448,6 +469,7 @@ export async function fetchPointerData(pointerApi, contractAddresses, chunkSize 
           pointerType || null
         ]);
 
+        // Insert the batch data into the database
         await batchInsertOrUpdate('pointer_data', ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer', 'pointer_type'], batchData, 'contract_address');
         log(`Stored pointer data for ${batchData.length} addresses`, 'DEBUG');
       } else {
@@ -457,6 +479,7 @@ export async function fetchPointerData(pointerApi, contractAddresses, chunkSize 
       log(`Error processing pointer data chunk: ${error.message}`, 'ERROR');
     }
   }
+  log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
 // Helper function to process associated wallets

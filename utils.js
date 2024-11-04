@@ -5,6 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { config } from './config.js';
+import { WebSocket } from 'ws';
+
 
 // ES module-compatible __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -71,11 +73,10 @@ export async function retryOperation(operation, retries = 3, delay = 1000, backo
  * @param {string} contractAddress - The contract address to query.
  * @param {Object} payload - The query payload that will be base64 encoded.
  * @param {boolean} usePost - If true, sends the query using a POST request; otherwise, uses GET. Defaults to false.
- * @param {boolean} skip400ErrorLog - If true, skips logging error for 400 status, used only in identifyContractTypes.
+ * @param {boolean} skip400ErrorLog - If true, completely ignores 400 status errors, used only in identifyContractTypes.
  * @returns {Object} - The parsed response from the contract query, or an error object if the request failed.
  */
 export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false) {
-  // Encode the payload as a base64 string
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
   const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
 
@@ -88,40 +89,33 @@ export async function sendContractQuery(restAddress, contractAddress, payload, u
       ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload })
       : await axios.get(`${requestUrl}/${encodedPayload}`);
 
-    // Handle expected successful response
     if (response.status === 200) {
       log(`Received response for contract ${contractAddress}`, 'DEBUG');
-      return response.data; // Return the parsed JSON response
-    } 
-    
-    // Handle specific cases for 400 error as expected behavior
-    else if (response.status === 400) {
-      if (!skip400ErrorLog) {
-        log(`Expected error 400 received for contract ${contractAddress}`, 'INFO');
-      }
-      if (response.data && response.data.message) {
-        return { error: null, message: response.data.message }; // Return message for type parsing
-      } else {
-        log(`400 error received but no message available in response for contract ${contractAddress}`, 'ERROR');
-        return { error: '400 Error - No message in response' };
-      }
+      return { data: response.data, error: null, message: response.data.message || null };
+    }
+
+    // Ignore 400 errors entirely if skip400ErrorLog is true
+    if (response.status === 400 && skip400ErrorLog) {
+      return { data: null, error: null, message: response.data?.message || 'Expected 400 response' };
     }
 
     // Handle other specific error statuses (e.g., 404, 403, etc.)
-    else if ([404, 403, 501, 503].includes(response.status)) {
-      log(`Error querying contract: ${response.status} - ${response.statusText}`, 'ERROR');
-      return { error: `Error: ${response.status} - ${response.statusText}` };
-    } else {
-      // For other statuses, just return the raw response data
-      return response.data;
+    if ([404, 403, 501, 503].includes(response.status)) {
+      const errorMsg = `Error querying contract: ${response.status} - ${response.statusText}`;
+      log(errorMsg, 'ERROR');
+      return { data: null, error: errorMsg, message: response.data?.message || null };
     }
+
+    // Fallback return for unexpected responses
+    return { data: response.data, error: `Unexpected status ${response.status}`, message: response.data?.message || null };
+
   } catch (error) {
-    // Log error if the request completely failed
-    log(`Error querying contract: ${error.message}`, 'ERROR');
-    if (error.response && error.response.data) {
-      log(`Response data: ${JSON.stringify(error.response.data)}`, 'DEBUG');
+    // Log and return detailed error information, standardizing the structure
+    const errorMsg = error.response?.data?.message || error.message;
+    if (!(skip400ErrorLog && error.response?.status === 400)) {
+      log(`Error querying contract ${contractAddress}: ${errorMsg}`, 'ERROR');
     }
-    return { error: error.message };
+    return { data: null, error: errorMsg, message: error.response?.data?.message || null };
   }
 }
 
@@ -248,7 +242,6 @@ export async function fetchData(url, retries = 3) {
   return response || {}; // Avoid throwing an error, return an empty object to let main functions handle it
 }
 
-// WebSocket connection utility
 export function createWebSocketConnection(url, onMessageCallback, onErrorCallback) {
   const ws = new WebSocket(url);
 
