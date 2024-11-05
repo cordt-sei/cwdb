@@ -392,7 +392,7 @@ export async function fetchTokensAndOwners(restAddress) {
           log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Total: ${allTokens.length}`, 'DEBUG');
 
           // Ownership lookup for each token in parallel
-          if (/721|1155/i.test(contractType)) {
+          if (cw721_base|cw1155|cw404/i.test(contractType)) {
             const ownershipPromises = tokenIds.map(tokenId => limit(async () => {
               const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
               const ownerResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, ownerQueryPayload));
@@ -444,13 +444,14 @@ export async function fetchTokensAndOwners(restAddress) {
 
 // Fetch pointer data and store it in the database
 export async function fetchPointerData(pointerApi) {
-  const chunkSize = config.chunkSize || 25; // Default to 10 if chunkSize is not defined in config
+  const chunkSize = config.chunkSize || 25; // Default to 25 if not defined
 
-  // Retrieve all contract addresses from the contracts table
-  const contractAddresses = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
+  // Retrieve all addresses from the contracts table and split them into an array
+  const addressResult = db.prepare('SELECT address FROM contracts').all();
+  const contractAddresses = addressResult.map(row => row.address);
 
-  // Check if contractAddresses is valid
-  if (!Array.isArray(contractAddresses) || contractAddresses.length === 0) {
+  // Check if contractAddresses array is valid
+  if (contractAddresses.length === 0) {
     log(`Error: No contract addresses found in the database`, 'ERROR');
     return; // Exit function if no addresses are found
   }
@@ -462,16 +463,17 @@ export async function fetchPointerData(pointerApi) {
     contractAddresses.forEach(address => insertQuery.run(address));
   })();
 
+  // Process the addresses in chunks and send requests to pointerApi
   for (let i = 0; i < contractAddresses.length; i += chunkSize) {
-    const chunk = contractAddresses.slice(i, i + chunkSize); // Get a chunk of addresses for each batch
-    const payload = { addresses: chunk }; // Prepare payload
+    const chunk = contractAddresses.slice(i, i + chunkSize); // Prepare a chunk of addresses
+    const payload = { addresses: chunk }; // Payload with addresses array
 
     try {
       // Send the batch request to the pointer API with retry logic
       const response = await retryOperation(() => axios.post(pointerApi, payload));
 
       if (response && response.status === 200 && Array.isArray(response.data)) {
-        // Parse the response to extract necessary fields for each address
+        // Parse the response for each address and prepare data for insertion
         const batchData = response.data.map(({ address, pointerAddress, pointeeAddress, isBaseAsset, isPointer, pointerType }) => [
           address,
           pointerAddress || null,
@@ -481,7 +483,7 @@ export async function fetchPointerData(pointerApi) {
           pointerType || null
         ]);
 
-        // Insert the batch data into the database
+        // Insert or update batch data in the pointer_data table
         await batchInsertOrUpdate(
           'pointer_data',
           ['contract_address', 'pointer_address', 'pointee_address', 'is_base_asset', 'is_pointer', 'pointer_type'],
