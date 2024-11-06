@@ -604,12 +604,17 @@ export async function fetchPointerData(pointerApi) {
   log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
-// Helper function to process associated wallets
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
     log('Starting fetchAssociatedWallets...', 'DEBUG');
     
-    const owners = db.prepare('SELECT DISTINCT owner FROM nft_owners').all();
+    // Select distinct owners from `nft_owners` but only if not present in `wallet_associations`
+    const owners = db.prepare(`
+      SELECT DISTINCT owner 
+      FROM nft_owners
+      WHERE owner NOT IN (SELECT wallet_address FROM wallet_associations)
+    `).all();
+    
     if (owners.length === 0) {
       log('No unique owners found in nft_owners table.', 'DEBUG');
       return;
@@ -633,8 +638,17 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
           const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
           
           if (response.status === 200 && response.data?.result) {
+            // Insert or update the `wallet_associations` table
             await batchInsertOrUpdate('wallet_associations', ['wallet_address', 'evm_address'], [[owner, response.data.result]], 'wallet_address');
             log(`Stored EVM address for ${owner}`, 'DEBUG');
+
+            // Update all instances of this owner in `nft_owners`
+            db.prepare(`
+              UPDATE nft_owners
+              SET owner = ?
+              WHERE owner = ?
+            `).run(response.data.result, owner);
+
           } else {
             log(`No EVM address found for ${owner}`, 'DEBUG');
           }
