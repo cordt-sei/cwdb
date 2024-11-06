@@ -172,7 +172,7 @@ export async function fetchPaginatedData(url, key, options = {}) {
 }
 
 // Helper function to batch database operations
-export function batchInsertOrUpdate(tableName, columns, values, uniqueColumn) {
+export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
   if (!Array.isArray(values) || values.length === 0) {
     log('No values provided for batch insertion or update.', 'DEBUG');
     return;
@@ -180,31 +180,41 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumn) {
 
   const placeholders = values[0].map(() => '?').join(', ');
   const sqlInsert = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
-  const sqlUpdate = `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(', ')} WHERE ${uniqueColumn} = ?`;
+
+  // If uniqueColumns is an array, create a composite key condition for the WHERE clause
+  const updateConditions = Array.isArray(uniqueColumns)
+    ? uniqueColumns.map(col => `${col} = ?`).join(' AND ')
+    : `${uniqueColumns} = ?`;
+
+  const sqlUpdate = `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(', ')} WHERE ${updateConditions}`;
+
   const insert = db.prepare(sqlInsert);
   const update = db.prepare(sqlUpdate);
 
   const transaction = db.transaction((rows) => {
     for (const row of rows) {
       try {
-        const uniqueValue = row[columns.indexOf(uniqueColumn)];
+        // Determine the unique values based on uniqueColumns (array or single column)
+        const uniqueValues = Array.isArray(uniqueColumns)
+          ? uniqueColumns.map(col => row[columns.indexOf(col)])
+          : [row[columns.indexOf(uniqueColumns)]];
 
-        // Convert `msg` JSON to a safely escapable string if it exists in columns
+        // Safely handle JSON strings, NULL values, and JSON.stringify for complex columns
         const sanitizedRow = row.map((val, idx) => {
           if (columns[idx] === 'msg' && typeof val === 'string') {
-            return JSON.stringify(val); // Safely handle JSON strings
+            return JSON.stringify(val); // Escape JSON strings properly
           }
-          return val !== null ? val : 'NULL';
+          return val !== null ? val : null;
         });
-        
+
         log(`Processing row: ${sanitizedRow}`, 'DEBUG');
 
-        // Check for an existing row based on the unique column value
-        const existingRow = db.prepare(`SELECT * FROM ${tableName} WHERE ${uniqueColumn} = ?`).get(uniqueValue);
+        // Check for an existing row based on the unique column(s) value(s)
+        const existingRow = db.prepare(`SELECT * FROM ${tableName} WHERE ${updateConditions}`).get(...uniqueValues);
 
         if (existingRow) {
-          update.run([...sanitizedRow, uniqueValue]);
-          log(`Updated row in ${tableName} where ${uniqueColumn} = ${uniqueValue}`, 'DEBUG');
+          update.run([...sanitizedRow, ...uniqueValues]);
+          log(`Updated row in ${tableName} where ${updateConditions} with values ${JSON.stringify(uniqueValues)}`, 'DEBUG');
         } else {
           insert.run(sanitizedRow);
           log(`Inserted new row into ${tableName}`, 'DEBUG');

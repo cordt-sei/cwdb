@@ -355,15 +355,15 @@ export async function identifyContractTypes(restAddress) {
   }
 }
 
-// Fetch tokens and their owners for relevant contracts
+// Fetch tokens and their owners for relevant contracts, with enhanced logging and error handling for unsupported contracts
 export async function fetchTokensAndOwners(restAddress) {
   const delayBetweenBatches = 100;
-  const concurrencyLimit = config.concurrencyLimit || 5; // Max concurrent ownership requests
+  const concurrencyLimit = config.concurrencyLimit || 5;
   const limit = pLimit(concurrencyLimit);
 
   try {
     const progress = checkProgress('fetchTokensAndOwners');
-    const contracts = db.prepare("SELECT address, type FROM contracts WHERE type IN ('cw721', 'cw1155')").all();
+    const contracts = db.prepare("SELECT address, type FROM contracts WHERE type IN ('cw721', 'cw1155', 'cw404', 'cw20')").all();
     const startIndex = progress.last_processed ? contracts.findIndex(contract => contract.address === progress.last_processed) + 1 : 0;
 
     for (let i = startIndex; i < contracts.length; i++) {
@@ -372,9 +372,100 @@ export async function fetchTokensAndOwners(restAddress) {
       let ownershipData = [];
       let lastTokenFetched = null;
 
-      log(`Fetching tokens for contract ${contractAddress}`, 'INFO');
+      log(`Fetching tokens for contract ${contractAddress} of type ${contractType}`, 'INFO');
 
-      // Paginated token fetch loop
+      if (contractType === 'cw20') {
+        // Query token_info for supply details
+        const tokenInfoResponse = await sendContractQuery(restAddress, contractAddress, { token_info: {} });
+        log(`Token info response for ${contractAddress}: ${JSON.stringify(tokenInfoResponse)}`, 'DEBUG');
+
+        const totalSupply = tokenInfoResponse?.data?.total_supply;
+
+        if (!totalSupply) {
+          log(`No supply or unsupported contract spec for cw20 contract ${contractAddress}. Skipping...`, 'ERROR');
+          await updateProgress('fetchTokensAndOwners', 0, contractAddress);
+          continue;
+        }
+
+        log(`Recorded total supply for cw20 contract ${contractAddress}: ${totalSupply}`, 'INFO');
+        await batchInsertOrUpdate('contracts', ['address', 'tokens_minted'], [[contractAddress, totalSupply]], 'address');
+
+        let allAccounts = [];
+        let paginationKey = null;
+
+        do {
+          const accountsQueryPayload = { all_accounts: { limit: config.paginationLimit, ...(paginationKey && { start_after: paginationKey }) } };
+          const accountsResponse = await sendContractQuery(restAddress, contractAddress, accountsQueryPayload);
+          log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}`, 'DEBUG');
+
+          if (accountsResponse?.data?.accounts?.length > 0) {
+            const accounts = accountsResponse.data.accounts;
+            allAccounts.push(...accounts);
+            paginationKey = accounts[accounts.length - 1];
+            log(`Fetched ${accounts.length} accounts for cw20 contract ${contractAddress}. Accounts: ${accounts.join(', ')}`, 'DEBUG');
+          } else {
+            paginationKey = null;
+          }
+        } while (paginationKey);
+
+        const cw20OwnershipPromises = allAccounts.map(account => limit(async () => {
+          const balanceQueryPayload = { balance: { address: account } };
+          const balanceResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, balanceQueryPayload));
+          log(`Balance response for account ${account} in ${contractAddress}: ${JSON.stringify(balanceResponse)}`, 'DEBUG');
+
+          const balance = balanceResponse?.data?.balance;
+          if (balance) {
+            ownershipData.push([contractAddress, account, balance]);
+            log(`Recorded balance for cw20 contract ${contractAddress}: owner=${account}, balance=${balance}`, 'DEBUG');
+          } else {
+            log(`Failed to retrieve balance for account ${account} in cw20 contract ${contractAddress}.`, 'ERROR');
+          }
+        }));
+
+        await Promise.allSettled(cw20OwnershipPromises);
+
+        if (ownershipData.length > 0) {
+          await batchInsertOrUpdate('cw20_owners', ['token_contract_address', 'owner_address', 'balance'], ownershipData, ['token_contract_address', 'owner_address']);
+          log(`Inserted ${ownershipData.length} ownership records into cw20_owners for ${contractAddress}`, 'INFO');
+        }
+
+        await updateProgress('fetchTokensAndOwners', 0, contractAddress);
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+        continue;
+      }
+
+      // Process cw1155 contracts with metadata logging and token insertion
+      if (contractType === 'cw1155') {
+        do {
+          const tokenQueryPayload = { all_tokens: { limit: config.paginationLimit, ...(lastTokenFetched && { start_after: lastTokenFetched }) } };
+          const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
+          log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
+
+          if (response?.data?.data?.length > 0) {
+            const tokens = response.data.data;
+            const tokenInsertData = tokens.map(token => [
+              contractAddress,
+              token.token_id,
+              token.info.token_uri,
+              JSON.stringify(token.info.extension)
+            ]);
+            await batchInsertOrUpdate('contract_tokens', ['contract_address', 'token_id', 'token_uri', 'metadata'], tokenInsertData, ['contract_address', 'token_id']);
+            log(`Inserted ${tokens.length} cw1155 tokens for contract ${contractAddress}`, 'INFO');
+
+            lastTokenFetched = tokens[tokens.length - 1].token_id;
+            allTokens.push(...tokens.map(token => token.token_id));
+          } else {
+            lastTokenFetched = null;
+          }
+        } while (lastTokenFetched);
+
+        log(`Fetched ${allTokens.length} tokens for cw1155 contract ${contractAddress}`, 'INFO');
+        await updateProgress('fetchTokensAndOwners', 0, contractAddress);
+        await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
+        continue;
+      }
+
+      // Process other contract types (cw721, cw404)
       while (true) {
         const tokenQueryPayload = {
           all_tokens: {
@@ -384,29 +475,29 @@ export async function fetchTokensAndOwners(restAddress) {
         };
 
         const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
+        log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
 
         if (response?.tokens?.length > 0) {
           const tokenIds = response.tokens;
           allTokens.push(...tokenIds);
           lastTokenFetched = tokenIds[tokenIds.length - 1];
-          log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Total: ${allTokens.length}`, 'DEBUG');
+          log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Token IDs: ${tokenIds.join(', ')}`, 'DEBUG');
 
-          // Ownership lookup for each token in parallel
-          if (cw721_base|cw1155|cw404/i.test(contractType)) {
+          if (/(cw721|cw1155|cw404)/i.test(contractType)) {
             const ownershipPromises = tokenIds.map(tokenId => limit(async () => {
               const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
               const ownerResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, ownerQueryPayload));
+              log(`Ownership response for token ${tokenId} in ${contractAddress}: ${JSON.stringify(ownerResponse)}`, 'DEBUG');
 
               if (ownerResponse?.owner) {
                 ownershipData.push([contractAddress, tokenId, ownerResponse.owner, contractType]);
-                log(`Fetched ownership for token ${tokenId}: owner is ${ownerResponse.owner}`, 'DEBUG');
+                log(`Recorded ownership for token ${tokenId} in ${contractAddress}: owner=${ownerResponse.owner}`, 'DEBUG');
               }
             }));
 
-            await Promise.allSettled(ownershipPromises); // Wait for all ownership fetches for current tokens
+            await Promise.allSettled(ownershipPromises);
           }
 
-          // Break out if fewer tokens than the limit were fetched, indicating the last page
           if (tokenIds.length < config.paginationLimit) break;
         } else {
           log(`No more tokens found for contract ${contractAddress}`, 'INFO');
@@ -415,9 +506,8 @@ export async function fetchTokensAndOwners(restAddress) {
       }
 
       if (allTokens.length > 0) {
-        // Batch insert token IDs and ownership data
-        await batchInsertOrUpdate('contracts', ['address', 'token_ids'], [[contractAddress, allTokens.join(',')]], 'address');
-        log(`Updated token_ids for ${contractAddress}`, 'INFO');
+        await batchInsertOrUpdate('contracts', ['address', 'tokens_minted'], [[contractAddress, allTokens.join(',')]], 'address');
+        log(`Updated tokens_minted for ${contractAddress} with total tokens: ${allTokens.length}`, 'INFO');
 
         const tokenInsertData = allTokens.map(tokenId => [contractAddress, tokenId, contractType]);
         await batchInsertOrUpdate('contract_tokens', ['contract_address', 'token_id', 'contract_type'], tokenInsertData, ['contract_address', 'token_id']);
@@ -425,16 +515,15 @@ export async function fetchTokensAndOwners(restAddress) {
 
         if (ownershipData.length > 0) {
           await batchInsertOrUpdate('nft_owners', ['collection_address', 'token_id', 'owner', 'contract_type'], ownershipData, ['collection_address', 'token_id']);
-          log(`Inserted ${ownershipData.length} ownership records into nft_owners`, 'INFO');
+          log(`Inserted ${ownershipData.length} ownership records into nft_owners for ${contractAddress}`, 'INFO');
         }
       }
 
-      // Update progress to avoid re-fetching on restart
       await updateProgress('fetchTokensAndOwners', 0, contractAddress, lastTokenFetched);
-      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches)); // Delay to manage API rate limits
+      await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
     }
 
-    updateProgress('fetchTokensAndOwners', 1); // Mark progress as complete
+    updateProgress('fetchTokensAndOwners', 1);
     log('Finished processing tokens and ownership for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchTokensAndOwners: ${error.message}`, 'ERROR');

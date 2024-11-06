@@ -44,7 +44,7 @@ function initializeDatabase() {
       creator TEXT,
       admin TEXT,
       label TEXT,
-      token_ids TEXT
+      tokens_minted TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS contract_history (
       contract_address TEXT,
@@ -65,7 +65,7 @@ function initializeDatabase() {
       token_id TEXT,
       owner TEXT,
       contract_type TEXT,
-      PRIMARY KEY (collection_address, token_id)
+      PRIMARY KEY (collection_address, token_id, owner)
     )`,
     `CREATE TABLE IF NOT EXISTS pointer_data (
       contract_address TEXT PRIMARY KEY,
@@ -89,7 +89,22 @@ function initializeDatabase() {
         log(`Table created/verified: ${statement}`, 'INFO');
       }
     })();
-    log('All tables initialized successfully.', 'INFO');
+
+    // Verify existence of columns in contract_tokens and add them if missing
+    const columnCheck = dbInstance.prepare("PRAGMA table_info(contract_tokens)").all();
+
+    const columns = columnCheck.map(col => col.name);
+    if (!columns.includes("token_uri")) {
+      dbInstance.prepare(`ALTER TABLE contract_tokens ADD COLUMN token_uri TEXT`).run();
+      log("Added missing column 'token_uri' to 'contract_tokens' table.", 'INFO');
+    }
+
+    if (!columns.includes("metadata")) {
+      dbInstance.prepare(`ALTER TABLE contract_tokens ADD COLUMN metadata TEXT`).run();
+      log("Added missing column 'metadata' to 'contract_tokens' table.", 'INFO');
+    }
+
+    log('All tables initialized successfully, with contract_tokens schema validated.', 'INFO');
   } catch (error) {
     log(`Failed during table initialization: ${error.message}`, 'ERROR');
     throw error;
