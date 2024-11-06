@@ -479,15 +479,18 @@ export async function fetchTokensAndOwners(restAddress) {
         const tokenQueryPayload = {
           all_tokens: {
             limit: config.paginationLimit,
-            ...(lastTokenFetched && { start_after_id: lastTokenFetched })
+            ...(lastTokenFetched && { start_after: lastTokenFetched })
           }
         };
+
+        console.log(restAddress, contractAddress, tokenQueryPayload);
+
 
         const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
         log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
 
-        if (response?.tokens?.length > 0) {
-          const tokenIds = response.tokens;
+        if (response?.data?.data?.tokens?.length > 0) {
+          const tokenIds = response.data.data.tokens;
           allTokens.push(...tokenIds);
           lastTokenFetched = tokenIds[tokenIds.length - 1];
           log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Token IDs: ${tokenIds.join(', ')}`, 'DEBUG');
@@ -500,9 +503,9 @@ export async function fetchTokensAndOwners(restAddress) {
               );
               log(`Ownership response for token ${tokenId} in ${contractAddress}: ${JSON.stringify(ownerResponse)}`, 'DEBUG');
 
-              if (ownerResponse?.owner) {
-                ownershipData.push([contractAddress, tokenId, ownerResponse.owner, contractType]);
-                log(`Recorded ownership for token ${tokenId} in ${contractAddress}: owner=${ownerResponse.owner}`, 'DEBUG');
+              if (ownerResponse?.data.data.owner) {
+                ownershipData.push([contractAddress, tokenId, ownerResponse.data.data.owner, contractType]);
+                log(`Recorded ownership for token ${tokenId} in ${contractAddress}: owner=${ownerResponse.data.data.owner}`, 'DEBUG');
               }
             }));
 
