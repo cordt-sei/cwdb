@@ -361,15 +361,15 @@ export async function identifyContractTypes(restAddress) {
   }
 }
 
-// Fetch tokens and their owners for relevant contracts, with enhanced logging and error handling for unsupported contracts
+// Fetch tokens and their owners for relevant contracts
 export async function fetchTokensAndOwners(restAddress) {
   const delayBetweenBatches = 100;
   const concurrencyLimit = config.concurrencyLimit || 5;
   const limit = pLimit(concurrencyLimit);
+  const blockHeightHeader = { 'x-cosmos-block-height': config.blockHeight.toString() };
 
   try {
     const progress = checkProgress('fetchTokensAndOwners');
-    // Adjust query to capture specific contract types, replacing "cw721%" with "cw721_base"
     const contracts = db.prepare("SELECT address, type FROM contracts WHERE type = 'cw721_base' OR type = 'cw1155' OR type = 'cw404' OR type = 'cw20_base'").all();
     const startIndex = progress.last_processed ? contracts.findIndex(contract => contract.address === progress.last_processed) + 1 : 0;
 
@@ -386,7 +386,7 @@ export async function fetchTokensAndOwners(restAddress) {
         const tokenInfoResponse = await sendContractQuery(restAddress, contractAddress, { token_info: {} });
         log(`Token info response for ${contractAddress}: ${JSON.stringify(tokenInfoResponse)}`, 'DEBUG');
 
-        const totalSupply = tokenInfoResponse?.data?.total_supply;
+        const totalSupply = tokenInfoResponse?.data?.data?.total_supply;
 
         if (!totalSupply) {
           log(`No supply or unsupported contract spec for cw20 contract ${contractAddress}. Skipping...`, 'ERROR');
@@ -417,7 +417,9 @@ export async function fetchTokensAndOwners(restAddress) {
 
         const cw20OwnershipPromises = allAccounts.map(account => limit(async () => {
           const balanceQueryPayload = { balance: { address: account } };
-          const balanceResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, balanceQueryPayload));
+          const balanceResponse = await retryOperation(() =>
+            sendContractQuery(restAddress, contractAddress, balanceQueryPayload, false, false, blockHeightHeader)
+          );
           log(`Balance response for account ${account} in ${contractAddress}: ${JSON.stringify(balanceResponse)}`, 'DEBUG');
 
           const balance = balanceResponse?.data?.balance;
@@ -493,7 +495,9 @@ export async function fetchTokensAndOwners(restAddress) {
           if (/(cw721_base|cw1155|cw404)/i.test(contractType)) {
             const ownershipPromises = tokenIds.map(tokenId => limit(async () => {
               const ownerQueryPayload = { owner_of: { token_id: tokenId.toString() } };
-              const ownerResponse = await retryOperation(() => sendContractQuery(restAddress, contractAddress, ownerQueryPayload));
+              const ownerResponse = await retryOperation(() =>
+                sendContractQuery(restAddress, contractAddress, ownerQueryPayload, false, false, blockHeightHeader)
+              );
               log(`Ownership response for token ${tokenId} in ${contractAddress}: ${JSON.stringify(ownerResponse)}`, 'DEBUG');
 
               if (ownerResponse?.owner) {
