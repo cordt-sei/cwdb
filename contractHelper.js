@@ -604,6 +604,7 @@ export async function fetchPointerData(pointerApi) {
   log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
+// fetch all evm wallet addresses for owners in nft_owners
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
     log('Starting fetchAssociatedWallets...', 'DEBUG');
@@ -645,17 +646,8 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
           
           if (response.status === 200 && response.data?.result) {
             // Insert or update the `wallet_associations` table
-            // Insert or update the `wallet_associations` table
             await batchInsertOrUpdate('wallet_associations', ['wallet_address', 'evm_address'], [[owner, response.data.result]], 'wallet_address');
             log(`Stored EVM address for ${owner}`, 'DEBUG');
-
-            // Update all instances of this owner in `nft_owners`
-            db.prepare(`
-              UPDATE nft_owners
-              SET owner = ?
-              WHERE owner = ?
-            `).run(response.data.result, owner);
-
 
             // Update all instances of this owner in `nft_owners`
             db.prepare(`
