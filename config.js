@@ -5,7 +5,7 @@ export const config = {
   paginationLimit: 100,
   concurrencyLimit: 5,
   numWorkers: 4,
-  restAddress: "https://snowy-solitary-patron.sei-pacific.quiknode.pro/b85f33628bfb46d8a184419284f47270a24b4488",
+  restAddress: "http://3.26.171.139:1317",
   wsAddress: "ws://tasty.seipex.fi:26657/websocket",
   evmRpcAddress: "http://tasty.seipex.fi:8545",
   pointerApi: "https://pointer.basementnodes.ca",
