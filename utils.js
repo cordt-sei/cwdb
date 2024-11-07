@@ -74,9 +74,10 @@ export async function retryOperation(operation, retries = 3, delay = 1000, backo
  * @param {Object} payload - The query payload that will be base64 encoded.
  * @param {boolean} usePost - If true, sends the query using a POST request; otherwise, uses GET. Defaults to false.
  * @param {boolean} skip400ErrorLog - If true, completely ignores 400 status errors, used only in identifyContractTypes.
+ * @param {Object} [headers={}] - Optional headers to include in the request.
  * @returns {Object} - The parsed response from the contract query, or an error object if the request failed.
  */
-export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false) {
+export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false, headers = {}) {
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
   const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
 
@@ -84,33 +85,29 @@ export async function sendContractQuery(restAddress, contractAddress, payload, u
   log(`Encoded Payload: ${encodedPayload}`, 'DEBUG');
   
   try {
-    // Choose the request method based on usePost flag
+    const config = { headers };
     const response = usePost
-      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload })
-      : await axios.get(`${requestUrl}/${encodedPayload}`);
+      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload }, config)
+      : await axios.get(`${requestUrl}/${encodedPayload}`, config);
 
     if (response.status === 200) {
       log(`Received response for contract ${contractAddress}`, 'DEBUG');
       return { data: response.data, error: null, message: response.data.message || null };
     }
 
-    // Ignore 400 errors entirely if skip400ErrorLog is true
     if (response.status === 400 && skip400ErrorLog) {
       return { data: null, error: null, message: response.data?.message || 'Expected 400 response' };
     }
 
-    // Handle other specific error statuses (e.g., 404, 403, etc.)
     if ([404, 403, 501, 503].includes(response.status)) {
       const errorMsg = `Error querying contract: ${response.status} - ${response.statusText}`;
       log(errorMsg, 'ERROR');
       return { data: null, error: errorMsg, message: response.data?.message || null };
     }
 
-    // Fallback return for unexpected responses
     return { data: response.data, error: `Unexpected status ${response.status}`, message: response.data?.message || null };
 
   } catch (error) {
-    // Log and return detailed error information, standardizing the structure
     const errorMsg = error.response?.data?.message || error.message;
     if (!(skip400ErrorLog && error.response?.status === 400)) {
       log(`Error querying contract ${contractAddress}: ${errorMsg}`, 'ERROR');
