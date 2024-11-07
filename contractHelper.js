@@ -402,7 +402,7 @@ export async function fetchTokensAndOwners(restAddress) {
 
         do {
           const accountsQueryPayload = { all_accounts: { limit: config.paginationLimit, ...(paginationKey && { start_after: paginationKey }) } };
-          const accountsResponse = await sendContractQuery(restAddress, contractAddress, accountsQueryPayload);
+          const accountsResponse = await sendContractQuery(restAddress, contractAddress, accountsQueryPayload, false, false, blockHeightHeader);
           log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}`, 'DEBUG');
 
           if (accountsResponse?.data?.accounts?.length > 0) {
@@ -447,7 +447,7 @@ export async function fetchTokensAndOwners(restAddress) {
       if (contractType === 'cw1155') {
         do {
           const tokenQueryPayload = { all_tokens: { limit: config.paginationLimit, ...(lastTokenFetched && { start_after: lastTokenFetched }) } };
-          const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
+          const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload, false, false, blockHeightHeader);
           log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
 
           if (response?.data?.data?.length > 0) {
@@ -482,11 +482,9 @@ export async function fetchTokensAndOwners(restAddress) {
             ...(lastTokenFetched && { start_after: lastTokenFetched })
           }
         };
-
         console.log(restAddress, contractAddress, tokenQueryPayload);
 
-
-        const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload);
+        const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload, false, false, blockHeightHeader);
         log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
 
         if (response?.data?.data?.tokens?.length > 0) {
