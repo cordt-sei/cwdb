@@ -1,216 +1,305 @@
 // utils.js
-
-import axios from 'axios';
-import WebSocket from 'ws';
+import { axios } from './contractHelper.js';
 import fs from 'fs';
 import path from 'path';
-import { promisify } from 'util';
+import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
+import { config } from './config.js';
+import { WebSocket } from 'ws';
 
-// Logging function to write to both console and log file
-export function log(message) {
-  console.log(message);
-  
-  const logDir = './logs';
-  const logFile = path.join(logDir, 'data_collection.log');
 
-  // Ensure the logs directory exists
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
+// ES module-compatible __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Initialize the SQLite database
+const db = new Database(path.join(__dirname, './data/indexer.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+
+// Export the db instance for use in other modules
+export { db };
+
+
+export function log(message, level = 'INFO') {
+  const logLevels = { 'ERROR': 0, 'INFO': 1, 'DEBUG': 2 };
+  const currentLogLevel = config.logLevel || 'INFO';
+
+  // Skip logging if the message level is below the current log level
+  if (logLevels[level] > logLevels[currentLogLevel]) return;
+
+  // Format the log message
+  const timestamp = new Date().toISOString();
+  const formattedMessage = `[${timestamp}] [${level}] ${message}`;
+
+  // Log to console based on level
+  if (level === 'ERROR' || currentLogLevel === 'DEBUG' || (level === 'INFO' && currentLogLevel !== 'ERROR')) {
+    console.log(formattedMessage);
   }
 
-  // Append to the log file
-  fs.appendFileSync(logFile, message + '\n');
+  // Write to file if enabled and not DEBUG level to avoid duplicate log file entries
+  if (config.logToFile && level !== 'DEBUG') {
+    const logDir = './logs';
+    const logFile = path.join(logDir, 'data_collection.log');
+
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    
+    // Log directly to file without additional console confirmation
+    fs.appendFileSync(logFile, formattedMessage + '\n');
+  }
 }
 
-// Retry function that avoids retrying on certain status codes like 400
-export async function retryOperation(operation, retries = 3, delay = 1000) {
+// Retry function with exponential backoff and jitter
+export async function retryOperation(operation, retries = 3, delay = 1000, backoffFactor = 2) {
   for (let i = 0; i < retries; i++) {
     try {
       return await operation();
     } catch (error) {
-      // Avoid retrying if the error status is 400 (bad request)
-      if (error.response && error.response.status === 400) {
-        log(`Operation failed due to a 400 error: ${error.response.data?.message || error.message}`);
-        throw error;
-      }
-
-      if (i < retries - 1) {
-        log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        log(`Operation failed after ${retries} retries: ${error.message}`);
-        throw error;
-      }
+      log(`Retrying operation (${i + 1}/${retries}) after failure: ${error.message}`, 'INFO');
+      const jitter = Math.random() * delay;
+      await new Promise(resolve => setTimeout(resolve, delay + jitter));
+      delay *= backoffFactor;
     }
+  }
+  log(`Operation failed after ${retries} retries.`, 'ERROR');
+  return null; // Avoid throwing an error, return null to let main functions handle it
+}
+
+/**
+ * Sends a smart contract query to the REST endpoint.
+ * Handles encoding the payload in base64 format and accepts an optional POST request.
+ * 
+ * @param {string} restAddress - The REST API address.
+ * @param {string} contractAddress - The contract address to query.
+ * @param {Object} payload - The query payload that will be base64 encoded.
+ * @param {boolean} usePost - If true, sends the query using a POST request; otherwise, uses GET. Defaults to false.
+ * @param {boolean} skip400ErrorLog - If true, completely ignores 400 status errors, used only in identifyContractTypes.
+ * @param {Object} [headers={}] - Optional headers to include in the request.
+ * @returns {Object} - The parsed response from the contract query, or an error object if the request failed.
+ */
+export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false, headers = {}) {
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
+  const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
+
+  log(`Sending contract query to: ${requestUrl}`, 'DEBUG');
+  log(`Encoded Payload: ${encodedPayload}`, 'DEBUG');
+  
+  try {
+    const config = { headers };
+    const response = usePost
+      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload }, config)
+      : await axios.get(`${requestUrl}/${encodedPayload}`, config);
+
+    if (response.status === 200) {
+      log(`Received response for contract ${contractAddress}`, 'DEBUG');
+      return { data: response.data, error: null, message: response.data.message || null };
+    }
+
+    if (response.status === 400 && skip400ErrorLog) {
+      return { data: null, error: null, message: response.data?.message || 'Expected 400 response' };
+    }
+
+    if ([404, 403, 501, 503].includes(response.status)) {
+      const errorMsg = `Error querying contract: ${response.status} - ${response.statusText}`;
+      log(errorMsg, 'ERROR');
+      return { data: null, error: errorMsg, message: response.data?.message || null };
+    }
+
+    return { data: response.data, error: `Unexpected status ${response.status}`, message: response.data?.message || null };
+
+  } catch (error) {
+    const errorMsg = error.response?.data?.message || error.message;
+    if (!(skip400ErrorLog && error.response?.status === 400)) {
+      log(`Error querying contract ${contractAddress}: ${errorMsg}`, 'ERROR');
+    }
+    return { data: null, error: errorMsg, message: error.response?.data?.message || null };
   }
 }
 
-// Helper function to fetch paginated data
-export async function fetchPaginatedData(url, key, limit = 100, paginationType = 'offset', paginationPayload = null) {
+// Fetch paginated data with conventional pagination strategy
+export async function fetchPaginatedData(url, key, options = {}) {
+  const {
+    limit = 100,
+    retries = 3,
+    delay = 1000,
+    backoffFactor = 2
+  } = options;
+
   let allData = [];
-  let startAfter = null;
+  let nextKey = null;
+  let pageCount = 0; // Track page count to determine if pagination logs are necessary
+
+  log(`Fetching data for ${url.split('/').pop()}`, 'INFO'); // Simplified to show only the endpoint ID or type
 
   while (true) {
-    let requestUrl = url;
-    let payload;
+    const encodedNextKey = nextKey ? encodeURIComponent(nextKey) : '';
+    const requestUrl = `${url}?pagination.limit=${limit}${encodedNextKey ? `&pagination.key=${encodedNextKey}` : ''}`;
 
-    if (paginationType === 'offset') {
-      // For URL-based pagination (offset)
-      const params = new URLSearchParams();
-      params.set('pagination.limit', limit.toString());
-      params.set('pagination.offset', allData.length.toString());
-      requestUrl = `${url}?${params.toString()}`;
-    } else if (paginationType === 'query') {
-      // For query-based pagination (custom payload)
-      payload = {
-        ...paginationPayload,
-        limit,
-        ...(startAfter && { start_after: startAfter })
-      };
-    }
-
-    log(`Fetching data from: ${requestUrl}`);
+    const operation = async () => axios.get(requestUrl);
 
     try {
-      // Perform the request based on the pagination type
-      let response;
-      if (paginationType === 'offset') {
-        response = await retryOperation(() => axios.get(requestUrl));
-      } else if (paginationType === 'query') {
-        response = await retryOperation(() => axios.post(requestUrl, payload));
+      const response = await retryOperation(operation, retries, delay, backoffFactor);
+      if (!response || response.status !== 200 || !response.data) {
+        log(`Unexpected response structure for ${url}`, 'ERROR');
+        return allData;
       }
 
-      // Validate the response
-      if (response && response.status === 200 && response.data) {
-        const dataBatch = response.data[key] || [];
-        allData = allData.concat(dataBatch);
-        log(`Fetched ${dataBatch.length} items in this batch.`);
+      const dataBatch = Array.isArray(response.data[key]) ? response.data[key] : [];
+      allData = allData.concat(dataBatch);
 
-        // If the number of fetched items is less than the limit, it indicates the last page
-        if (dataBatch.length < limit) break;
+      pageCount += 1;
+      nextKey = response.data.pagination?.next_key || null;
 
-        // Update the startAfter for the next query batch
-        if (paginationType === 'query') {
-          startAfter = dataBatch[dataBatch.length - 1];
-        }
-      } else {
-        log(`Unexpected response structure: ${JSON.stringify(response?.data || {})}`);
-        break;
+      if (!nextKey) break; // Stop if no next_key is present
+
+      // Only log pagination if multiple pages are encountered
+      if (pageCount > 1) {
+        log(`Fetching additional page (${pageCount}) for ${url.split('/').pop()}`, 'INFO');
       }
+
+      if (dataBatch.length < limit) break;
     } catch (error) {
-      log(`Error fetching paginated data: ${error.message}`);
-      throw error;
+      log(`Error fetching paginated data from ${url}: ${error.message}`, 'ERROR');
+      return allData;
     }
   }
 
-  log(`Total data fetched: ${allData.length}`);
+  log(`Fetched ${allData.length} items for ${url.split('/').pop()}`, 'INFO'); // Final count log
   return allData;
 }
 
-// contract query function
-export async function sendContractQuery(restAddress, contractAddress, payload, headers = {}) {
-  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString('base64');
-  const url = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart/${payloadBase64}`;
-  
-  log(`Querying contract at URL: ${url} with payload: ${JSON.stringify(payload)}`);
-
-  try {
-    const response = await retryOperation(() => axios.get(url, { headers }));
-    
-    // Check for valid response
-    if (response && response.status === 200 && response.data) {
-      log(`Query successful for contract ${contractAddress}: ${JSON.stringify(response.data)}`);
-      return { data: response.data, status: response.status };
-    } else {
-      log(`Unexpected response structure or status for contract ${contractAddress}: ${response.status} - ${JSON.stringify(response.data)}`);
-      return { error: 'Unexpected response format', status: response.status };
-    }
-  } catch (error) {
-    // Improved logging for error scenarios
-    if (error.response) {
-      log(`Query failed for contract ${contractAddress} - HTTP ${error.response.status}: ${error.response.data?.message || error.message}`);
-      return { error: error.response.data?.message || 'Request failed', status: error.response.status };
-    } else {
-      log(`Error querying contract ${contractAddress}: ${error.message}`);
-      return { error: error.message, status: 500 };
-    }
-  }
-}
-
-
-// batchInsert with enhanced logging
-export async function batchInsert(dbRun, tableName, columns, data) {
-  if (data.length === 0) {
-    log(`No data to insert into ${tableName}. Skipping batch insert.`);
+// Helper function to batch database operations
+export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
+  if (!Array.isArray(values) || values.length === 0) {
+    log('No values provided for batch insertion or update.', 'DEBUG');
     return;
   }
 
-  const placeholders = data.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
-  const insertSQL = `INSERT OR REPLACE INTO ${tableName} (${columns.join(', ')}) VALUES ${placeholders}`;
-  const flatData = data.flat();
+  const placeholders = values[0].map(() => '?').join(', ');
+  const sqlInsert = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
+
+  // If uniqueColumns is an array, create a composite key condition for the WHERE clause
+  const updateConditions = Array.isArray(uniqueColumns)
+    ? uniqueColumns.map(col => `${col} = ?`).join(' AND ')
+    : `${uniqueColumns} = ?`;
+
+  const sqlUpdate = `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(', ')} WHERE ${updateConditions}`;
+
+  const insert = db.prepare(sqlInsert);
+  const update = db.prepare(sqlUpdate);
+
+  const transaction = db.transaction((rows) => {
+    for (const row of rows) {
+      try {
+        // Determine the unique values based on uniqueColumns (array or single column)
+        const uniqueValues = Array.isArray(uniqueColumns)
+          ? uniqueColumns.map(col => row[columns.indexOf(col)])
+          : [row[columns.indexOf(uniqueColumns)]];
+
+        // Safely handle JSON strings, NULL values, and JSON.stringify for complex columns
+        const sanitizedRow = row.map((val, idx) => {
+          if (columns[idx] === 'msg' && typeof val === 'string') {
+            return JSON.stringify(val); // Escape JSON strings properly
+          }
+          return val !== null ? val : null;
+        });
+
+        log(`Processing row: ${sanitizedRow}`, 'DEBUG');
+
+        // Check for an existing row based on the unique column(s) value(s)
+        const existingRow = db.prepare(`SELECT * FROM ${tableName} WHERE ${updateConditions}`).get(...uniqueValues);
+
+        if (existingRow) {
+          update.run([...sanitizedRow, ...uniqueValues]);
+          log(`Updated row in ${tableName} where ${updateConditions} with values ${JSON.stringify(uniqueValues)}`, 'DEBUG');
+        } else {
+          insert.run(sanitizedRow);
+          log(`Inserted new row into ${tableName}`, 'DEBUG');
+        }
+      } catch (error) {
+        log(`Failed to insert or update row in ${tableName}: ${error.message}`, 'ERROR');
+      }
+    }
+  });
 
   try {
-    await dbRun(insertSQL, flatData);
-    log(`Successfully inserted ${data.length} rows into ${tableName}.`);
+    transaction(values);
+    log(`Successfully processed ${values.length} rows in ${tableName}`, 'DEBUG');
   } catch (error) {
-    log(`Error performing batch insert into ${tableName}: ${error.message}`);
-    throw error;
+    log(`Failed to process rows in ${tableName}: ${error.message}`, 'ERROR');
   }
 }
 
-
-// Updated checkProgress to include last_fetched_token
-export async function checkProgress(db, step) {
-  const dbGet = promisify(db.get).bind(db);
-  const sql = `SELECT completed, last_processed, last_fetched_token FROM indexer_progress WHERE step = ?`;
-  try {
-    const result = await dbGet(sql, [step]);
-    return result || { completed: 0, last_processed: null, last_fetched_token: null };
-  } catch (error) {
-    console.error(`Error checking progress for step ${step}:`, error);
-    return { completed: 0, last_processed: null, last_fetched_token: null };
-  }
+// General-purpose GET request with retry logic
+export async function fetchData(url, retries = 3) {
+  const response = await retryOperation(async () => {
+    try {
+      const res = await axios.get(url, { timeout: config.timeout });
+      log(`Received response for GET request: ${JSON.stringify(res.data)}`, 'DEBUG');
+      if (res.status !== 200) {
+        log(`Failed to fetch data: ${res.status} - ${res.statusText}`, 'ERROR');
+        return null;
+      }
+      return res.data;
+    } catch (error) {
+      log(`Error fetching data from ${url}: ${error.message}`, 'ERROR');
+      return null;
+    }
+  }, retries);
+  return response || {}; // Avoid throwing an error, return an empty object to let main functions handle it
 }
 
-// Updated updateProgress to handle last_fetched_token
-export async function updateProgress(db, step, completed = 1, lastProcessed = null, lastFetchedToken = null) {
-  const dbRun = promisify(db.run).bind(db);
-  const sql = `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token) VALUES (?, ?, ?, ?)`;
-  try {
-    await dbRun(sql, [step, completed, lastProcessed, lastFetchedToken]);
-  } catch (error) {
-    console.error(`Error updating progress for step ${step}:`, error);
-    throw error;
-  }
-}
-
-// WebSocket setup function
-export function setupWebSocket(url, messageHandler, log) {
+export function createWebSocketConnection(url, onMessageCallback, onErrorCallback) {
   const ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('Connected to WebSocket');
+    log(`WebSocket connection established to ${url}`, 'INFO');
   });
 
   ws.on('message', (data) => {
     try {
-      const message = JSON.parse(data);
-      messageHandler(message);  // Delegate message handling to the passed handler
+      const parsedData = JSON.parse(data);
+      log(`Received WebSocket message: ${JSON.stringify(parsedData)}`, 'DEBUG');
+      onMessageCallback(parsedData);
     } catch (error) {
-      log(`Error processing WebSocket message: ${error.message}`);
+      log(`Failed to parse WebSocket message: ${error.message}`, 'ERROR');
     }
   });
 
-  ws.on('close', () => {
-    log('WebSocket connection closed. Reconnecting...');
-    setTimeout(() => setupWebSocket(url, messageHandler, log), 5000);  // Reconnect after 5 seconds
-  });
-
   ws.on('error', (error) => {
-    log(`WebSocket error: ${error.message}`);
+    log(`WebSocket error on ${url}: ${error.message}`, 'ERROR');
+    if (onErrorCallback) onErrorCallback(error);
   });
 
-  return ws;  // Return the WebSocket instance for external control if needed
+  ws.on('close', () => {
+    log(`WebSocket connection closed for ${url}`, 'INFO');
+  });
+
+  return ws;
 }
 
-export { promisify } from 'util';
+// Helper function to check progress in the database
+export function checkProgress(step) {
+  try {
+    const row = db.prepare('SELECT completed, last_processed, last_fetched_token FROM indexer_progress WHERE step = ?').get(step);
+    if (row) {
+      return row;
+    }
+    return { completed: 0, last_processed: null, last_fetched_token: null };
+  } catch (error) {
+    log(`Error checking progress for step ${step}: ${error.message}`, 'ERROR');
+    return { completed: 0, last_processed: null, last_fetched_token: null }; // Return default progress
+  }
+}
+
+// Helper function to update progress in the database
+export function updateProgress(step, completed = 1, lastProcessed = null, lastFetchedToken = null) {
+  try {
+    db.prepare(
+      `INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token) VALUES (?, ?, ?, ?)`
+    ).run(step, completed, lastProcessed, lastFetchedToken);
+    log(`Progress updated for step ${step}`, 'DEBUG');
+  } catch (error) {
+    log(`Error updating progress for step ${step}: ${error.message}`, 'ERROR');
+  }
+}
