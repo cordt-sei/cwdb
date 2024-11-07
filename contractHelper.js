@@ -285,6 +285,7 @@ export async function identifyContractTypes(restAddress) {
     const contracts = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
     const progress = checkProgress('identifyContractTypes');
     const startIndex = progress.last_processed ? contracts.indexOf(progress.last_processed) + 1 : 0;
+    const blockHeightHeader = { 'x-cosmos-block-height': config.blockHeight.toString() };
     const batchSize = 50;
     let batchData = [];
     let processedCount = 0;
