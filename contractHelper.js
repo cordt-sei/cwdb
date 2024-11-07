@@ -297,7 +297,7 @@ export async function identifyContractTypes(restAddress) {
 
       try {
         // Send a query to check the contract type
-        const response = await sendContractQuery(restAddress, contractAddress, testPayload, false, true);
+        const response = await sendContractQuery(restAddress, contractAddress, testPayload, false, true, blockHeightHeader);
 
         // Log the entire response message for debugging purposes
         if (response?.message) {
@@ -383,7 +383,7 @@ export async function fetchTokensAndOwners(restAddress) {
 
       if (contractType === 'cw20_base') {
         // Query token_info for supply details
-        const tokenInfoResponse = await sendContractQuery(restAddress, contractAddress, { token_info: {} });
+      const tokenInfoResponse = await sendContractQuery(restAddress, contractAddress, { token_info: {} }, false, false, blockHeightHeader);
         log(`Token info response for ${contractAddress}: ${JSON.stringify(tokenInfoResponse)}`, 'DEBUG');
 
         const totalSupply = tokenInfoResponse?.data?.data?.total_supply;
