@@ -607,11 +607,12 @@ export async function fetchPointerData(pointerApi) {
 // fetch all evm wallet addresses for owners in nft_owners
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
-    log('Starting fetchAssociatedWallets...', 'DEBUG');
+    log('Starting fetchAssociatedWallets function...', 'INFO');
     
     // Get the last processed owner from indexer_progress
     const progress = checkProgress('fetchAssociatedWallets');
     let lastProcessedOwner = progress.last_processed;
+    log(`Resuming from last processed owner: ${lastProcessedOwner || 'None'}`, 'INFO');
 
     // Select distinct owners from `nft_owners` who haven't been processed or are greater than `lastProcessedOwner`
     const owners = db.prepare(`
@@ -623,16 +624,18 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
     `).all(lastProcessedOwner || '');
 
     if (owners.length === 0) {
-      log('No unique owners found in nft_owners table.', 'DEBUG');
+      log('No unprocessed owners found in nft_owners table.', 'INFO');
       return;
     }
 
-    log(`Found ${owners.length} unique owners to process`, 'DEBUG');
+    log(`Found ${owners.length} unique owners to process`, 'INFO');
     
     for (let i = 0; i < owners.length; i += concurrencyLimit) {
       const batch = owners.slice(i, i + concurrencyLimit);
+      log(`Processing batch ${Math.floor(i / concurrencyLimit) + 1} of ${Math.ceil(owners.length / concurrencyLimit)}`, 'INFO');
+      
       await Promise.all(batch.map(async ({ owner }) => {
-        log(`Fetching EVM address for ${owner}`, 'DEBUG');
+        log(`Fetching EVM address for owner: ${owner}`, 'DEBUG');
         
         const payload = {
           jsonrpc: "2.0",
@@ -645,35 +648,27 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
           const response = await retryOperation(() => axios.post(evmRpcAddress, payload));
           
           if (response.status === 200 && response.data?.result) {
-            // Insert or update the `wallet_associations` table
             await batchInsertOrUpdate('wallet_associations', ['wallet_address', 'evm_address'], [[owner, response.data.result]], 'wallet_address');
-            log(`Stored EVM address for ${owner}`, 'DEBUG');
-
-            // Update all instances of this owner in `nft_owners`
-            db.prepare(`
-              UPDATE nft_owners
-              SET owner = ?
-              WHERE owner = ?
-            `).run(response.data.result, owner);
-
+            log(`Stored EVM address for owner: ${owner}`, 'INFO');
           } else {
-            log(`No EVM address found for ${owner}`, 'DEBUG');
+            log(`No EVM address found for owner: ${owner}`, 'WARN');
           }
         } catch (error) {
-          log(`Error processing ${owner}: ${error.message}`, 'ERROR');
+          log(`Error processing owner ${owner}: ${error.message}`, 'ERROR');
         }
       }));
 
       // Update the progress with the last processed owner in this batch
       const lastOwnerInBatch = batch[batch.length - 1].owner;
       updateProgress('fetchAssociatedWallets', 0, lastOwnerInBatch);
+      log(`Updated progress for batch ${Math.floor(i / concurrencyLimit) + 1}`, 'DEBUG');
     }
 
     // Mark the step as completed if all owners were processed
     updateProgress('fetchAssociatedWallets', 1);
-    log('Finished processing associated wallets.', 'INFO');
+    log('Finished processing all associated wallets.', 'INFO');
   } catch (error) {
-    log(`Error in fetchAssociatedWallets: ${error.message}`, 'ERROR');
+    log(`Critical error in fetchAssociatedWallets: ${error.message}`, 'ERROR');
     throw error;
   }
 }
