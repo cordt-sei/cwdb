@@ -3,10 +3,18 @@
 export const config = {
   blockHeight: 94496767,
   paginationLimit: 100,
+  concurrencyLimit: 5,
   numWorkers: 4,
-  restAddress: "http://localhost:1317",
-  wsAddress: "ws://localhost:26657/websocket",
-  evmRpcAddress: "http://localhost:8545",
+  restAddress: "http://3.26.171.139:1317",
+  wsAddress: "ws://tasty.seipex.fi:26657/websocket",
+  evmRpcAddress: "http://tasty.seipex.fi:8545",
   pointerApi: "https://pointer.basementnodes.ca",
-  timeout: 5000 // Timeout in milliseconds
+  timeout: 5000,
+  logLevel: 'DEBUG',
+  logToFile: true,
+  retryConfig: {
+    retries: 3,
+    delay: 1000,
+    backoffFactor: 2
+  }
 };
