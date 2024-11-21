@@ -56,11 +56,13 @@ The following tables are used in the SQLite database:
 
 ## Running the Indexer
 
+
 Operating is extremely simple:
 
 - Complete `config.js`
 - Install dependencies
 - Run:
+
 
    ```sh
    yarn install && yarn start
@@ -91,3 +93,4 @@ The `indexer_progress` table tracks the last processed contract and token during
 Please submit issues or a pull request for any bug fixes or enhancements.
 
 #### * Run a local instance of the `pointer-api` using your own node and [this repo](https://github.com/cordt-sei/pointer-api)
+
