@@ -29,15 +29,25 @@ Simple indexer that queries cw contracts, specifically focusing on CW721, CW404,
 The main configuration is in `config.js`:
 
 ```js
+// config.js
+
 export const config = {
-  blockHeight: 94496767, // optional parameter to pass 'x-cosmos-block-height' in requests
+  blockHeight: 1,
   paginationLimit: 100,
+  concurrencyLimit: 5,
   numWorkers: 4,
   restAddress: "http://localhost:1317",
   wsAddress: "ws://localhost:26657/websocket",
   evmRpcAddress: "http://localhost:8545",
-  pointerApi: "https://pointer.basementnodes.ca", // *This is a custom endpoint
-  timeout: 5000
+  pointerApi: "https://pointer.basementnodes.ca",
+  timeout: 5000,
+  logLevel: 'DEBUG',
+  logToFile: true,
+  retryConfig: {
+    retries: 3,
+    delay: 1000,
+    backoffFactor: 2
+  }
 };
 ```
 
