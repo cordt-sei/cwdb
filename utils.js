@@ -77,18 +77,24 @@ export async function retryOperation(operation, retries = 3, delay = 1000, backo
  * @param {Object} [headers={}] - Optional headers to include in the request.
  * @returns {Object} - The parsed response from the contract query, or an error object if the request failed.
  */
-export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false, headers = {}) {
+export async function sendContractQuery(restAddress, contractAddress, payload, usePost = false, skip400ErrorLog = false) {
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
   const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/smart`;
 
   log(`Sending contract query to: ${requestUrl}`, 'DEBUG');
   log(`Encoded Payload: ${encodedPayload}`, 'DEBUG');
-  
+
+  // Dynamically handle the block height header based on config
+  const headers = {};
+  if (config.blockHeight !== null) {
+    headers['x-cosmos-block-height'] = config.blockHeight.toString(); // Only add header if blockHeight is not null
+  }
+
   try {
-    const config = { headers };
+    const configOptions = { headers }; // Attach dynamically constructed headers
     const response = usePost
-      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload }, config)
-      : await axios.get(`${requestUrl}/${encodedPayload}`, config);
+      ? await axios.post(requestUrl, { base64_encoded_payload: encodedPayload }, configOptions)
+      : await axios.get(`${requestUrl}/${encodedPayload}`, configOptions);
 
     if (response.status === 200) {
       log(`Received response for contract ${contractAddress}`, 'DEBUG');

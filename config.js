@@ -1,7 +1,7 @@
 // config.js
 
 export const config = {
-  blockHeight: 94496767,
+  blockHeight: null,
   paginationLimit: 100,
   concurrencyLimit: 5,
   numWorkers: 4,
