@@ -161,43 +161,50 @@ export async function fetchContractHistory(restAddress) {
       let nextKey = null;
 
       while (true) {
-        const queryPayload = nextKey ? { pagination: { key: nextKey } } : {};
-
-        const response = await sendContractQuery(restAddress, contractAddress, queryPayload, false, false);
-        if (!response?.data) {
-          log(`Failed to fetch history for ${contractAddress}.`, 'ERROR');
-          break;
-        }
-
-        const { entries, pagination } = response.data;
-        if (!Array.isArray(entries) || entries.length === 0) {
-          log(`No history entries found for ${contractAddress}`, 'INFO');
-          break;
-        }
-
-        // Prepare data for batch insert with proper escaping for SQLite
-        const insertData = entries.map(entry => [
-          contractAddress,
-          entry.operation || '', // Handle nulls with fallback
-          entry.code_id || '',   // Handle nulls with fallback
-          entry.updated || '',   // Handle nulls with fallback
-          JSON.stringify(entry.msg).replace(/"/g, '""').replace(/\\/g, '\\\\') // Double escape quotes and backslashes
-        ]);
+        // Correct history endpoint
+        const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}/history${nextKey ? `?pagination.key=${encodeURIComponent(nextKey)}` : ''}`;
 
         try {
+          const response = await axios.get(requestUrl);
+
+          if (response.status !== 200 || !response.data.entries) {
+            log(`No valid history entries for ${contractAddress}.`, 'ERROR');
+            break;
+          }
+
+          const { entries, pagination } = response.data;
+
+          if (!Array.isArray(entries) || entries.length === 0) {
+            log(`No history entries found for ${contractAddress}`, 'INFO');
+            break;
+          }
+
+          // Insert history entries into the database
+          const insertData = entries.map(entry => [
+            contractAddress,
+            entry.operation || '',
+            entry.code_id || '',
+            entry.updated || '',
+            JSON.stringify(entry.msg).replace(/"/g, '""').replace(/\\/g, '\\\\'),
+          ]);
+
           await batchInsertOrUpdate(
             'contract_history',
             ['contract_address', 'operation', 'code_id', 'updated', 'msg'],
             insertData,
             'contract_address'
           );
-          log(`Inserted ${entries.length} history entries for ${contractAddress}`, 'DEBUG');
-        } catch (dbError) {
-          log(`Error inserting history for ${contractAddress}: ${dbError.message}`, 'ERROR');
-        }
 
-        nextKey = pagination?.next_key || null;
-        if (!nextKey) break;
+          log(`Inserted ${entries.length} history entries for ${contractAddress}`, 'DEBUG');
+
+          // Update the nextKey for pagination
+          nextKey = pagination?.next_key || null;
+          if (!nextKey) break;
+
+        } catch (error) {
+          log(`Error querying history for ${contractAddress}: ${error.message}`, 'ERROR');
+          break;
+        }
       }
     }));
 
@@ -233,7 +240,8 @@ export async function fetchContractMetadata(restAddress) {
 
       const fetchPromises = batch.map(contractAddress => limit(async () => {
         try {
-          const response = await sendContractQuery(restAddress, contractAddress, {}, false, false);
+          const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`;
+          const response = await axios.get(requestUrl);
 
           if (response?.data?.contract_info) {
             const { code_id, creator, admin, label } = response.data.contract_info;
