@@ -401,6 +401,7 @@ export async function fetchTokensAndOwners(restAddress) {
       log(`Fetching tokens for contract ${contractAddress} of type ${contractType}`, 'INFO');
 
       if (contractType === 'cw20_base') {
+        // Handle cw20 contract type
         const tokenInfoResponse = await sendContractQuery(restAddress, contractAddress, { token_info: {} }, false, false);
         log(`Token info response for ${contractAddress}: ${JSON.stringify(tokenInfoResponse)}`, 'DEBUG');
 
@@ -476,13 +477,27 @@ export async function fetchTokensAndOwners(restAddress) {
           allTokens.push(...tokenIds);
           lastTokenFetched = tokenIds[tokenIds.length - 1];
           log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Token IDs: ${tokenIds.join(', ')}`, 'DEBUG');
+
+          // Write token data to `contract_tokens` table
+          const tokenData = tokenIds.map(tokenId => [contractAddress, tokenId]);
+          await batchInsertOrUpdate('contract_tokens', ['contract_address', 'token_id'], tokenData, ['contract_address', 'token_id']);
+          log(`Inserted ${tokenData.length} token records for contract ${contractAddress} into contract_tokens`, 'INFO');
         } else {
           log(`No more tokens found for contract ${contractAddress}`, 'INFO');
           break;
         }
       }
 
-      if (allTokens.length === 0) {
+      // If tokens were found, update `contracts`, `nft_owners` tables
+      if (allTokens.length > 0) {
+        await batchInsertOrUpdate('contracts', ['address', 'tokens_minted'], [[contractAddress, allTokens.length]], 'address');
+        log(`Updated tokens_minted for contract ${contractAddress} with total tokens: ${allTokens.length}`, 'INFO');
+
+        // Insert to `nft_owners` table
+        const nftOwnerData = allTokens.map(tokenId => [contractAddress, tokenId]);
+        await batchInsertOrUpdate('nft_owners', ['collection_address', 'token_id'], nftOwnerData, ['collection_address', 'token_id']);
+        log(`Inserted ${nftOwnerData.length} records into nft_owners for contract ${contractAddress}`, 'INFO');
+      } else {
         log(`No tokens retrieved for contract ${contractAddress}. Retrying...`, 'WARN');
         continue;
       }
