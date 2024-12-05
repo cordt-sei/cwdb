@@ -19,6 +19,7 @@ import {
 } from './utils.js';
 import { config } from './config.js';
 import fs from 'fs';
+import pLimit from 'p-limit';
 
 // Ensure data and logs directories exist
 if (!fs.existsSync('./data')) fs.mkdirSync('./data');
@@ -58,6 +59,8 @@ function initializeDatabase() {
       contract_address TEXT,
       token_id TEXT,
       contract_type TEXT,
+      token_uri TEXT,
+      metadata TEXT,
       PRIMARY KEY (contract_address, token_id)
     )`,
     `CREATE TABLE IF NOT EXISTS nft_owners (
@@ -90,20 +93,6 @@ function initializeDatabase() {
       }
     })();
 
-    // Verify existence of columns in contract_tokens and add them if missing
-    const columnCheck = dbInstance.prepare("PRAGMA table_info(contract_tokens)").all();
-
-    const columns = columnCheck.map(col => col.name);
-    if (!columns.includes("token_uri")) {
-      dbInstance.prepare(`ALTER TABLE contract_tokens ADD COLUMN token_uri TEXT`).run();
-      log("Added missing column 'token_uri' to 'contract_tokens' table.", 'INFO');
-    }
-
-    if (!columns.includes("metadata")) {
-      dbInstance.prepare(`ALTER TABLE contract_tokens ADD COLUMN metadata TEXT`).run();
-      log("Added missing column 'metadata' to 'contract_tokens' table.", 'INFO');
-    }
-
     log('All tables initialized successfully, with contract_tokens schema validated.', 'INFO');
   } catch (error) {
     log(`Failed during table initialization: ${error.message}`, 'ERROR');
@@ -130,6 +119,7 @@ async function runIndexer() {
     ];
 
     let allStepsCompleted = true;
+    let batchProgressUpdates = [];
 
     for (const step of steps) {
       let retries = 3;
@@ -144,9 +134,21 @@ async function runIndexer() {
           try {
             log(`Executing action for step: ${step.name}`, 'DEBUG');
             await step.action();
-            updateProgress(step.name, 1);
-            log(`Completed step: ${step.name}`, 'INFO');
+
+            // Collect progress updates in batches
+            batchProgressUpdates.push({ step: step.name, completed: 1 });
             completed = true;
+            log(`Completed step: ${step.name}`, 'INFO');
+
+            // Perform batch updates after every 5 steps to avoid excessive writes
+            if (batchProgressUpdates.length >= 5) {
+              batchProgressUpdates.forEach(({ step, completed }) => {
+                updateProgress(step, completed);
+              });
+              batchProgressUpdates = [];
+              log(`Batch progress updates committed for steps`, 'INFO');
+            }
+
           } catch (error) {
             retries--;
             log(`Error during step "${step.name}": ${error.message}. Retries left: ${retries}`, 'ERROR');
@@ -168,6 +170,14 @@ async function runIndexer() {
         allStepsCompleted = false;
         break;
       }
+    }
+
+    // Commit any remaining progress updates
+    if (batchProgressUpdates.length > 0) {
+      batchProgressUpdates.forEach(({ step, completed }) => {
+        updateProgress(step, completed);
+      });
+      log(`Final batch progress updates committed for steps`, 'INFO');
     }
 
     if (allStepsCompleted) {

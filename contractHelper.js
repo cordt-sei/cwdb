@@ -1,3 +1,5 @@
+// contractHelper.js
+
 import { 
   fetchPaginatedData, 
   sendContractQuery, 
@@ -23,7 +25,8 @@ export async function fetchCodeIds(restAddress) {
 
     let nextKey = null;
     let totalRecorded = 0;
-    let batchCount = 0; // Track the number of batches for clearer pagination context
+    let batchCount = 0;
+    let batchProgressUpdates = [];
 
     while (true) {
       const response = await fetchPaginatedData(
@@ -65,16 +68,21 @@ export async function fetchCodeIds(restAddress) {
         log(`Pagination continues; moving to the next page for code IDs.`, 'INFO');
       }
 
-      updateProgress('fetchCodeIds', 0, response[response.length - 1].code_id);
+      if (batchCount === 1 || batchCount % 20 === 0) {
+        batchProgressUpdates.push({ step: 'fetchCodeIds', completed: 0, lastProcessed: response[response.length - 1].code_id });
+      }
     }
 
     // Final log for total number of code IDs recorded
     if (totalRecorded > 0) {
       log(`Total code IDs fetched and stored: ${totalRecorded}`, 'INFO');
-      updateProgress('fetchCodeIds', 1);
+      batchProgressUpdates.push({ step: 'fetchCodeIds', completed: 1 });
     } else {
       log('No new code IDs recorded.', 'INFO');
     }
+
+    // Apply batched progress updates
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
   } catch (error) {
     log(`Error in fetchCodeIds: ${error.message}`, 'ERROR');
     throw error;
@@ -94,8 +102,9 @@ export async function fetchContractAddressesByCodeId(restAddress) {
     const startIndex = progress.last_processed ? codeIds.indexOf(progress.last_processed) + 1 : 0;
     const limit = pLimit(config.concurrencyLimit);
     let totalContracts = 0;
+    let batchProgressUpdates = [];
 
-    const fetchPromises = codeIds.slice(startIndex).map(code_id => limit(async () => {
+    const fetchPromises = codeIds.slice(startIndex).map((code_id, index) => limit(async () => {
       log(`Fetching contracts for code_id ${code_id}`, 'INFO');
 
       let allContracts = [];
@@ -138,11 +147,14 @@ export async function fetchContractAddressesByCodeId(restAddress) {
         log(`No contracts found for code_id ${code_id}`, 'INFO');
       }
 
-      updateProgress('fetchContractsByCode', 0, code_id);  // Unified identifier
+      if (index === 0 || index % 20 === 0) {
+        batchProgressUpdates.push({ step: 'fetchContractsByCode', completed: 0, lastProcessed: code_id });
+      }
     }));
 
     await Promise.allSettled(fetchPromises);
-    updateProgress('fetchContractsByCode', 1);  // Unified identifier
+    batchProgressUpdates.push({ step: 'fetchContractsByCode', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log(`Completed fetching contract addresses for all code IDs. Total contracts recorded: ${totalContracts}`, 'INFO');
   } catch (error) {
     log(`Error in fetchContractAddressesByCodeId: ${error.message}`, 'ERROR');
@@ -155,8 +167,9 @@ export async function fetchContractHistory(restAddress) {
   try {
     const contracts = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
     const limit = pLimit(config.concurrencyLimit);
+    let batchProgressUpdates = [];
 
-    const historyPromises = contracts.map(contractAddress => limit(async () => {
+    const historyPromises = contracts.map((contractAddress, index) => limit(async () => {
       log(`Fetching contract history for ${contractAddress}`, 'INFO');
       let nextKey = null;
 
@@ -192,7 +205,7 @@ export async function fetchContractHistory(restAddress) {
             'contract_history',
             ['contract_address', 'operation', 'code_id', 'updated', 'msg'],
             insertData,
-            'contract_address'
+            ['contract_address', 'operation', 'code_id'] // Correct ON CONFLICT to use composite key
           );
 
           log(`Inserted ${entries.length} history entries for ${contractAddress}`, 'DEBUG');
@@ -206,9 +219,15 @@ export async function fetchContractHistory(restAddress) {
           break;
         }
       }
+
+      if (index === 0 || index % 20 === 0) {
+        batchProgressUpdates.push({ step: 'fetchContractHistory', completed: 0, lastProcessed: contractAddress });
+      }
     }));
 
     await Promise.allSettled(historyPromises);
+    batchProgressUpdates.push({ step: 'fetchContractHistory', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Completed fetching contract history for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchContractHistory: ${error.message}`, 'ERROR');
@@ -231,6 +250,7 @@ export async function fetchContractMetadata(restAddress) {
     const contractAddresses = db.prepare('SELECT address FROM contracts').all().map(row => row.address);
     const totalContracts = contractAddresses.length;
     const startIndex = progress.last_processed ? contractAddresses.indexOf(progress.last_processed) + 1 : 0;
+    let batchProgressUpdates = [];
 
     log(`Starting fetchContractMetadata for ${totalContracts} contracts. Resuming from index ${startIndex}.`, 'INFO');
 
@@ -260,11 +280,12 @@ export async function fetchContractMetadata(restAddress) {
         log(`Batch inserted metadata for ${results.length} contracts (${i + results.length} of ${totalContracts})`, 'INFO');
       }
 
-      await updateProgress('fetchContractMetadata', 0, batch[batch.length - 1]);
+      batchProgressUpdates.push({ step: 'fetchContractMetadata', completed: 0, lastProcessed: batch[batch.length - 1] });
       await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
     }
 
-    await updateProgress('fetchContractMetadata', 1);
+    batchProgressUpdates.push({ step: 'fetchContractMetadata', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Finished processing metadata for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchContractMetadata: ${error.message}`, 'ERROR');
@@ -282,10 +303,11 @@ export async function identifyContractTypes(restAddress) {
     const batchSize = 50;
     let batchData = [];
     let processedCount = 0;
+    let batchProgressUpdates = [];
 
     const limit = pLimit(config.concurrencyLimit);
 
-    const typePromises = contracts.slice(startIndex).map(contractAddress => limit(async () => {
+    const typePromises = contracts.slice(startIndex).map((contractAddress, index) => limit(async () => {
       let contractType;
       const testPayload = { "a": "b" }; // Intentionally incorrect payload to trigger an error response
 
@@ -323,7 +345,7 @@ export async function identifyContractTypes(restAddress) {
         if (batchData.length >= batchSize) {
           await batchInsertOrUpdate('contracts', ['address', 'type'], batchData, 'address');
           batchData = []; // Clear batch after insert
-          await updateProgress('identifyContractTypes', 0, contractAddress); // Update last processed contract
+          batchProgressUpdates.push({ step: 'identifyContractTypes', completed: 0, lastProcessed: contractAddress }); // Batch update progress
         }
 
         // Periodic logging for every 100 contracts or at completion
@@ -335,6 +357,8 @@ export async function identifyContractTypes(restAddress) {
         if (error?.response?.status !== 400) {
           log(`Error determining contract type for ${contractAddress}: ${error.message}`, 'ERROR');
         }
+        // Mark contract as 'unknown' type if unable to determine
+        batchData.push([contractAddress, 'unknown']);
       }
     }));
 
@@ -346,8 +370,9 @@ export async function identifyContractTypes(restAddress) {
       log(`Final batch inserted contract types for ${batchData.length} contracts`, 'DEBUG');
     }
 
-    // Mark the step as completed
-    await updateProgress('identifyContractTypes', 1); 
+    // Batch update progress
+    batchProgressUpdates.push({ step: 'identifyContractTypes', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log(`Finished identifying contract types for all contracts.`, 'INFO');
   } catch (error) {
     log(`Error in identifyContractTypes: ${error.message}`, 'ERROR');
@@ -365,6 +390,7 @@ export async function fetchTokensAndOwners(restAddress) {
     const progress = checkProgress('fetchTokensAndOwners');
     const contracts = db.prepare("SELECT address, type FROM contracts WHERE type = 'cw721_base' OR type = 'cw1155' OR type = 'cw404' OR type = 'cw20_base'").all();
     const startIndex = progress.last_processed ? contracts.findIndex(contract => contract.address === progress.last_processed) + 1 : 0;
+    let batchProgressUpdates = [];
 
     for (let i = startIndex; i < contracts.length; i++) {
       const { address: contractAddress, type: contractType } = contracts[i];
@@ -382,7 +408,7 @@ export async function fetchTokensAndOwners(restAddress) {
 
         if (!totalSupply) {
           log(`No supply or unsupported contract spec for cw20 contract ${contractAddress}. Skipping...`, 'ERROR');
-          await updateProgress('fetchTokensAndOwners', 0, contractAddress);
+          batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 0, lastProcessed: contractAddress });
           continue;
         }
 
@@ -428,7 +454,7 @@ export async function fetchTokensAndOwners(restAddress) {
           log(`Inserted ${ownershipData.length} ownership records into cw20_owners for ${contractAddress}`, 'INFO');
         }
 
-        await updateProgress('fetchTokensAndOwners', 0, contractAddress);
+        batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 0, lastProcessed: contractAddress });
         await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
         continue;
       }
@@ -456,11 +482,17 @@ export async function fetchTokensAndOwners(restAddress) {
         }
       }
 
-      await updateProgress('fetchTokensAndOwners', 0, contractAddress, lastTokenFetched);
+      if (allTokens.length === 0) {
+        log(`No tokens retrieved for contract ${contractAddress}. Retrying...`, 'WARN');
+        continue;
+      }
+
+      batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 0, lastProcessed: contractAddress, lastFetchedToken: lastTokenFetched });
       await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
     }
 
-    updateProgress('fetchTokensAndOwners', 1);
+    batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed, update.lastFetchedToken));
     log('Finished processing tokens and ownership for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchTokensAndOwners: ${error.message}`, 'ERROR');
@@ -527,7 +559,7 @@ export async function fetchPointerData(pointerApi) {
   log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
-// fetch all evm wallet addresses for owners in nft_owners
+// Fetch all evm wallet addresses for owners in nft_owners
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
     log('Starting fetchAssociatedWallets function...', 'INFO');
@@ -549,6 +581,8 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
     }
 
     log(`Found ${owners.length} unique owners to process`, 'INFO');
+
+    let batchProgressUpdates = [];
 
     for (let i = 0; i < owners.length; i += concurrencyLimit) {
       const batch = owners.slice(i, i + concurrencyLimit);
@@ -580,11 +614,12 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
       );
 
       const lastOwnerInBatch = batch[batch.length - 1].owner;
-      await updateProgress('fetchAssociatedWallets', 0, lastOwnerInBatch);
+      batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 0, lastProcessed: lastOwnerInBatch });
       log(`Updated progress for batch ${Math.floor(i / concurrencyLimit) + 1}`, 'DEBUG');
     }
 
-    await updateProgress('fetchAssociatedWallets', 1);
+    batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 1 });
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Finished processing all associated wallets.', 'INFO');
   } catch (error) {
     log(`Critical error in fetchAssociatedWallets: ${error.message}`, 'ERROR');

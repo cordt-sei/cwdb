@@ -7,7 +7,6 @@ import Database from 'better-sqlite3';
 import { config } from './config.js';
 import { WebSocket } from 'ws';
 
-
 // ES module-compatible __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,7 +18,6 @@ db.pragma('synchronous = NORMAL');
 
 // Export the db instance for use in other modules
 export { db };
-
 
 export function log(message, level = 'INFO') {
   const logLevels = { 'ERROR': 0, 'INFO': 1, 'DEBUG': 2 };
@@ -182,46 +180,32 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
   }
 
   const placeholders = values[0].map(() => '?').join(', ');
-  const sqlInsert = `INSERT INTO ${tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
 
-  // If uniqueColumns is an array, create a composite key condition for the WHERE clause
-  const updateConditions = Array.isArray(uniqueColumns)
-    ? uniqueColumns.map(col => `${col} = ?`).join(' AND ')
-    : `${uniqueColumns} = ?`;
+  // Use SQLite's ON CONFLICT DO UPDATE syntax for insert or update in a single step
+  const updateAssignments = columns.map(col => `${col} = excluded.${col}`).join(', ');
+  const sql = `
+    INSERT INTO ${tableName} (${columns.join(', ')}) 
+    VALUES (${placeholders})
+    ON CONFLICT (${Array.isArray(uniqueColumns) ? uniqueColumns.join(', ') : uniqueColumns})
+    DO UPDATE SET ${updateAssignments}
+  `;
 
-  const sqlUpdate = `UPDATE ${tableName} SET ${columns.map(col => `${col} = ?`).join(', ')} WHERE ${updateConditions}`;
+  const statement = db.prepare(sql);
 
-  const insert = db.prepare(sqlInsert);
-  const update = db.prepare(sqlUpdate);
-
+  // Execute all rows in a transaction for better performance
   const transaction = db.transaction((rows) => {
     for (const row of rows) {
       try {
-        // Determine the unique values based on uniqueColumns (array or single column)
-        const uniqueValues = Array.isArray(uniqueColumns)
-          ? uniqueColumns.map(col => row[columns.indexOf(col)])
-          : [row[columns.indexOf(uniqueColumns)]];
-
-        // Safely handle JSON strings, NULL values, and JSON.stringify for complex columns
-        const sanitizedRow = row.map((val, idx) => {
-          if (columns[idx] === 'msg' && typeof val === 'string') {
-            return JSON.stringify(val); // Escape JSON strings properly
+        // Sanitize each row to properly handle JSON objects or null values
+        const sanitizedRow = row.map((val) => {
+          if (typeof val === 'object' && val !== null) {
+            return JSON.stringify(val); // Convert object to JSON string
           }
           return val !== null ? val : null;
         });
 
         log(`Processing row: ${sanitizedRow}`, 'DEBUG');
-
-        // Check for an existing row based on the unique column(s) value(s)
-        const existingRow = db.prepare(`SELECT * FROM ${tableName} WHERE ${updateConditions}`).get(...uniqueValues);
-
-        if (existingRow) {
-          update.run([...sanitizedRow, ...uniqueValues]);
-          log(`Updated row in ${tableName} where ${updateConditions} with values ${JSON.stringify(uniqueValues)}`, 'DEBUG');
-        } else {
-          insert.run(sanitizedRow);
-          log(`Inserted new row into ${tableName}`, 'DEBUG');
-        }
+        statement.run(sanitizedRow);
       } catch (error) {
         log(`Failed to insert or update row in ${tableName}: ${error.message}`, 'ERROR');
       }
