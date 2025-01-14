@@ -422,10 +422,10 @@ export async function fetchTokensAndOwners(restAddress) {
         do {
           const accountsQueryPayload = { all_accounts: { limit: config.paginationLimit, ...(paginationKey && { start_after: paginationKey }) } };
           const accountsResponse = await sendContractQuery(restAddress, contractAddress, accountsQueryPayload, false, false);
-          log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}`, 'DEBUG');
+          log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}, length=${accountsResponse?.data?.data?.accounts?.length}`, 'DEBUG');
 
-          if (accountsResponse?.data?.accounts?.length > 0) {
-            const accounts = accountsResponse.data.accounts;
+          if (accountsResponse?.data?.data?.accounts?.length > 0) {
+            const accounts = accountsResponse.data.data.accounts;
             allAccounts.push(...accounts);
             paginationKey = accounts[accounts.length - 1];
             log(`Fetched ${accounts.length} accounts for cw20 contract ${contractAddress}. Accounts: ${accounts.join(', ')}`, 'DEBUG');
@@ -439,7 +439,7 @@ export async function fetchTokensAndOwners(restAddress) {
           const balanceResponse = await sendContractQuery(restAddress, contractAddress, balanceQueryPayload, false, false);
           log(`Balance response for account ${account} in ${contractAddress}: ${JSON.stringify(balanceResponse)}`, 'DEBUG');
 
-          const balance = balanceResponse?.data?.balance;
+          const balance = balanceResponse?.data?.data?.balance;
           if (balance) {
             ownershipData.push([contractAddress, account, balance]);
             log(`Recorded balance for cw20 contract ${contractAddress}: owner=${account}, balance=${balance}`, 'DEBUG');

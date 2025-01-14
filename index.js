@@ -63,6 +63,12 @@ function initializeDatabase() {
       metadata TEXT,
       PRIMARY KEY (contract_address, token_id)
     )`,
+    `CREATE TABLE IF NOT EXISTS cw20_owners (
+      contract_address TEXT,
+      owner_address TEXT,
+      balance TEXT,
+      PRIMARY KEY (contract_address, owner_address)
+    )`,
     `CREATE TABLE IF NOT EXISTS nft_owners (
       collection_address TEXT,
       token_id TEXT,
