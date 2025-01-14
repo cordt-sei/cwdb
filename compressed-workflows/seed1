@@ -1,0 +1,305 @@
+// index.js
+
+import { 
+  fetchCodeIds, 
+  fetchContractAddressesByCodeId,
+  fetchContractMetadata,
+  fetchContractHistory, 
+  identifyContractTypes, 
+  fetchTokensAndOwners, 
+  fetchPointerData, 
+  fetchAssociatedWallets 
+} from '../contractHelper.js';
+import { 
+  createWebSocketConnection, 
+  log, 
+  checkProgress, 
+  updateProgress,
+  db
+} from '../utils.js';
+import { config } from '../config.js';
+import fs from 'fs';
+import fetch from 'node-fetch'; // Add fetch for REST API requests
+import pLimit from 'p-limit';
+
+// Ensure data and logs directories exist
+if (!fs.existsSync('./data')) fs.mkdirSync('./data');
+if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
+
+async function fetchCodeIdForContract(contractAddress) {
+  const url = `${config.restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch code_id for contract ${contractAddress}`);
+    }
+    const data = await response.json();
+    return data.contract_info.code_id;
+  } catch (error) {
+    log(`Error fetching code_id for ${contractAddress}: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+async function seedContracts() {
+  const contracts = [
+    "sei1pkteljh83a83gmazcvam474f7dwt9wzcyqcf5puxvqqs6jcx8nnq2y74lu",
+    "sei1g2a0q3tddzs7vf7lk45c2tgufsaqerxmsdr2cprth3mjtuqxm60qdmravc",
+    "sei13zrt6ts27fd7rl3hfha7t63udghm0d904ds68h5wsvkkx5md9jqqkd7z5j"
+  ];
+
+  try {
+    log('Starting contract seeding process...', 'INFO');
+
+    for (const contractAddress of contracts) {
+      const codeId = await fetchCodeIdForContract(contractAddress);
+      db.transaction(() => {
+        // Insert into code_ids table
+        db.prepare(`
+          INSERT OR IGNORE INTO code_ids (code_id, creator, instantiate_permission)
+          VALUES (?, ?, ?)
+        `).run(codeId, 'manual_seed', 'unrestricted');
+        log(`Inserted code_id ${codeId} for contract ${contractAddress}`, 'INFO');
+
+        // Insert into contracts table
+        db.prepare(`
+          INSERT OR IGNORE INTO contracts (code_id, address, type, creator, admin, label, tokens_minted)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(codeId, contractAddress, null, 'manual_creator', null, 'manually_seeded', null);
+        log(`Inserted contract ${contractAddress} with code_id ${codeId}`, 'INFO');
+      });
+    }
+
+    db.transaction(() => {
+      // Mark fetchCodeIds and fetchContractsByCode as completed
+      db.prepare(`
+        INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token)
+        VALUES (?, 1, NULL, NULL)
+      `).run('fetchCodeIds');
+      db.prepare(`
+        INSERT OR REPLACE INTO indexer_progress (step, completed, last_processed, last_fetched_token)
+        VALUES (?, 1, NULL, NULL)
+      `).run('fetchContractsByCode');
+      log('Marked fetchCodeIds and fetchContractsByCode as completed.', 'INFO');
+    });
+
+    log('All contracts seeded with correct code_ids and progress updated successfully.', 'INFO');
+  } catch (error) {
+    log(`Error during contract seeding: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+function initializeDatabase() {
+  const createTableStatements = [
+    `CREATE TABLE IF NOT EXISTS indexer_progress (
+      step TEXT PRIMARY KEY,
+      completed INTEGER DEFAULT 0,
+      last_processed TEXT,
+      last_fetched_token TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS code_ids (
+      code_id TEXT PRIMARY KEY,
+      creator TEXT,
+      instantiate_permission TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS contracts (
+      code_id TEXT,
+      address TEXT PRIMARY KEY,
+      type TEXT,
+      creator TEXT,
+      admin TEXT,
+      label TEXT,
+      tokens_minted TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_history (
+      contract_address TEXT,
+      operation TEXT,
+      code_id TEXT,
+      updated TEXT,
+      msg TEXT,
+      PRIMARY KEY (contract_address, operation, code_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS contract_tokens (
+      contract_address TEXT,
+      token_id TEXT,
+      contract_type TEXT,
+      token_uri TEXT,
+      metadata TEXT,
+      PRIMARY KEY (contract_address, token_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS cw20_owners (
+      contract_address TEXT,
+      owner_address TEXT,
+      balance TEXT,
+      PRIMARY KEY (contract_address, owner_address)
+    )`,
+    `CREATE TABLE IF NOT EXISTS nft_owners (
+      collection_address TEXT,
+      token_id TEXT,
+      owner TEXT,
+      contract_type TEXT,
+      PRIMARY KEY (collection_address, token_id, owner)
+    )`,
+    `CREATE TABLE IF NOT EXISTS pointer_data (
+      contract_address TEXT PRIMARY KEY,
+      pointer_address TEXT,
+      pointee_address TEXT,
+      is_base_asset INTEGER,
+      is_pointer INTEGER,
+      pointer_type TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS wallet_associations (
+      wallet_address TEXT PRIMARY KEY,
+      evm_address TEXT
+    )`
+  ];
+
+  const progressSteps = [
+    'fetchCodeIds',
+    'fetchContractsByCode',
+    'fetchContractMetadata',
+    'fetchContractHistory',
+    'identifyContractTypes',
+    'fetchTokensAndOwners',
+    'fetchPointerData',
+    'fetchAssociatedWallets'
+  ];
+
+  try {
+    const dbInstance = db; // Using better-sqlite3 instance directly
+    dbInstance.transaction(() => {
+      for (const statement of createTableStatements) {
+        dbInstance.prepare(statement).run();
+        log(`Table created/verified: ${statement}`, 'INFO');
+      }
+
+      // Insert default progress rows
+      progressSteps.forEach((step) => {
+        dbInstance.prepare(`
+          INSERT OR IGNORE INTO indexer_progress (step, completed, last_processed, last_fetched_token)
+          VALUES (?, 0, NULL, NULL)
+        `).run(step);
+      });
+
+    })();
+
+    log('All tables and progress steps initialized successfully.', 'INFO');
+  } catch (error) {
+    log(`Failed during table initialization: ${error.message}`, 'ERROR');
+    throw error;
+  }
+}
+
+if (process.argv.includes('--init-db')) {
+  initializeDatabase();
+  console.log('Database initialization complete.');
+  process.exit(0);
+}
+
+if (process.argv.includes('--seed-contracts')) {
+  seedContracts()
+    .then(() => {
+      console.log('Contract seeding complete.');
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error(`Failed to seed contracts: ${error.message}`);
+      process.exit(1);
+    });
+}
+
+// Main function to run the indexer
+async function runIndexer() {
+  try {
+    log(`Indexer started with log level: ${config.logLevel}`, 'INFO');
+    initializeDatabase();
+    log('Database initialized successfully.', 'INFO');
+
+    const steps = [
+      { name: 'fetchContractsByCode', action: () => fetchContractAddressesByCodeId(config.restAddress) },
+      { name: 'fetchContractMetadata', action: () => fetchContractMetadata(config.restAddress) },
+      { name: 'fetchContractHistory', action: () => fetchContractHistory(config.restAddress) },
+      { name: 'identifyContractTypes', action: () => identifyContractTypes(config.restAddress) },
+      { name: 'fetchTokensAndOwners', action: () => fetchTokensAndOwners(config.restAddress) },
+      { name: 'fetchPointerData', action: () => fetchPointerData(config.pointerApi) },
+      { name: 'fetchAssociatedWallets', action: () => fetchAssociatedWallets(config.evmRpcAddress) }
+    ];
+
+    let allStepsCompleted = true;
+    let batchProgressUpdates = [];
+
+    for (const step of steps) {
+      let retries = 3;
+      let completed = false;
+
+      while (retries > 0 && !completed) {
+        const progress = checkProgress(step.name);
+        log(`Progress for ${step.name}: completed=${progress.completed}`, 'DEBUG');
+
+        if (!progress.completed) {
+          log(`Starting step: ${step.name}`, 'INFO');
+          try {
+            log(`Executing action for step: ${step.name}`, 'DEBUG');
+            await step.action();
+
+            batchProgressUpdates.push({ step: step.name, completed: 1 });
+            completed = true;
+            log(`Completed step: ${step.name}`, 'INFO');
+
+          } catch (error) {
+            retries--;
+            log(`Error during step "${step.name}": ${error.message}. Retries left: ${retries}`, 'ERROR');
+            if (retries === 0) {
+              allStepsCompleted = false;
+              log(`Failed step "${step.name}" after multiple retries.`, 'ERROR');
+              break;
+            }
+          }
+        } else {
+          completed = true;
+          log(`Skipping step: ${step.name} (already completed)`, 'INFO');
+        }
+      }
+
+      if (!completed) {
+        log(`Aborting indexing due to failure in step: ${step.name}`, 'ERROR');
+        allStepsCompleted = false;
+        break;
+      }
+    }
+
+    if (batchProgressUpdates.length > 0) {
+      batchProgressUpdates.forEach(({ step, completed }) => {
+        updateProgress(step, completed);
+      });
+      log(`Final batch progress updates committed.`, 'INFO');
+    }
+
+    if (allStepsCompleted) {
+      log('All indexing steps completed successfully.', 'INFO');
+      createWebSocketConnection(config.wsAddress, handleMessage, log);
+      log('WebSocket setup initiated after successful indexing.', 'INFO');
+    }
+  } catch (error) {
+    log(`Failed to run indexer: ${error.message}`, 'ERROR');
+  }
+}
+
+function handleMessage(message) {
+  log(`WebSocket message received: ${JSON.stringify(message)}`, 'DEBUG');
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  log('Received SIGINT. Saving progress before shutdown...', 'INFO');
+  runIndexer()
+    .finally(() => {
+      log('Indexer terminated gracefully.', 'INFO');
+      process.exit();
+    });
+});
+
+runIndexer().catch((error) => {
+  log(`Failed to initialize and run the indexer: ${error.message}`, 'ERROR');
+});
