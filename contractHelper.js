@@ -318,47 +318,41 @@ export async function identifyContractTypes(restAddress) {
         // Log the entire response message for debugging purposes
         if (response?.message) {
           log(`Debug: Full error message for ${contractAddress}: ${response.message}`, 'DEBUG');
+
           
           // Attempt to extract the contract type from the error message, if available
           const match = response.message.match(/Error parsing into type ([\w]+)::/);
           if (match) {
-            contractType = match[1]; // Capture only the base type
+            contractType = match[1];
             log(`Identified contract type for ${contractAddress}: ${contractType}`, 'INFO');
           } else {
             log(`No recognizable type in error message for contract ${contractAddress}`, 'INFO');
-          }          
+          }
         } else {
           log(`No 'message' field in response for contract ${contractAddress}`, 'DEBUG');
         }
 
-        // If no contract type was identified, set to 'unknown'
-        if (!contractType) {
-          log(`Unexpected format for contract ${contractAddress}. Full response: ${JSON.stringify(response)}`, 'DEBUG');
-          contractType = 'unknown';
-        }
-
-        // Add to batch data
-        batchData.push([contractAddress, contractType]);
-        processedCount++;
-
-        // Insert batch data when reaching batch size
-        if (batchData.length >= batchSize) {
-          await batchInsertOrUpdate('contracts', ['address', 'type'], batchData, 'address');
-          batchData = []; // Clear batch after insert
-          batchProgressUpdates.push({ step: 'identifyContractTypes', completed: 0, lastProcessed: contractAddress }); // Batch update progress
-        }
-
-        // Periodic logging for every 100 contracts or at completion
-        if (processedCount % 100 === 0 || processedCount === contracts.length) {
-          log(`Progress: Processed ${processedCount} / ${contracts.length} contracts`, 'INFO');
-        }
+        contractType = contractType || 'unknown';
+        log(`Processed contract ${contractAddress} with type ${contractType}`, 'DEBUG');
       } catch (error) {
         // Log any unexpected errors that aren't related to type parsing
         if (error?.response?.status !== 400) {
           log(`Error determining contract type for ${contractAddress}: ${error.message}`, 'ERROR');
         }
-        // Mark contract as 'unknown' type if unable to determine
-        batchData.push([contractAddress, 'unknown']);
+        contractType = 'unknown';
+      }
+
+      batchData.push([contractAddress, contractType]);
+      processedCount++;
+
+      if (batchData.length >= batchSize) {
+        await batchInsertOrUpdate('contracts', ['address', 'type'], batchData, 'address');
+        batchData = [];
+        batchProgressUpdates.push({ step: 'identifyContractTypes', completed: 0, lastProcessed: contractAddress });
+      }
+
+      if (processedCount % 100 === 0 || processedCount === contracts.length) {
+        log(`Progress: Processed ${processedCount} / ${contracts.length} contracts`, 'INFO');
       }
     }));
 
@@ -388,7 +382,7 @@ export async function fetchTokensAndOwners(restAddress) {
 
   try {
     const progress = checkProgress('fetchTokensAndOwners');
-    const contracts = db.prepare("SELECT address, type FROM contracts WHERE type = 'cw721_base' OR type = 'cw1155' OR type = 'cw404' OR type = 'cw20_base'").all();
+    const contracts = db.prepare("SELECT address, type FROM contracts WHERE type IN ('cw721_base', 'cw1155', 'cw404', 'cw20_base')").all();
     const startIndex = progress.last_processed ? contracts.findIndex(contract => contract.address === progress.last_processed) + 1 : 0;
     let batchProgressUpdates = [];
 
@@ -422,10 +416,10 @@ export async function fetchTokensAndOwners(restAddress) {
         do {
           const accountsQueryPayload = { all_accounts: { limit: config.paginationLimit, ...(paginationKey && { start_after: paginationKey }) } };
           const accountsResponse = await sendContractQuery(restAddress, contractAddress, accountsQueryPayload, false, false);
-          log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}, length=${accountsResponse?.data?.data?.accounts?.length}`, 'DEBUG');
+          log(`Accounts response for ${contractAddress}: ${JSON.stringify(accountsResponse)}`, 'DEBUG');
 
-          if (accountsResponse?.data?.data?.accounts?.length > 0) {
-            const accounts = accountsResponse.data.data.accounts;
+          const accounts = accountsResponse?.data?.data?.accounts || [];
+          if (accounts.length > 0) {
             allAccounts.push(...accounts);
             paginationKey = accounts[accounts.length - 1];
             log(`Fetched ${accounts.length} accounts for cw20 contract ${contractAddress}. Accounts: ${accounts.join(', ')}`, 'DEBUG');
@@ -462,33 +456,24 @@ export async function fetchTokensAndOwners(restAddress) {
 
       // Process other contract types (cw1155, cw721_base, etc.)
       while (true) {
-        const tokenQueryPayload = {
-          all_tokens: {
-            limit: config.paginationLimit,
-            ...(lastTokenFetched && { start_after: lastTokenFetched }),
-          },
-        };
-
+        const tokenQueryPayload = { all_tokens: { limit: config.paginationLimit, ...(lastTokenFetched && { start_after: lastTokenFetched }) } };
         const response = await sendContractQuery(restAddress, contractAddress, tokenQueryPayload, false, false);
         log(`Token response for ${contractAddress}: ${JSON.stringify(response)}`, 'DEBUG');
 
-        if (response?.data?.data?.tokens?.length > 0) {
-          const tokenIds = response.data.data.tokens;
-          allTokens.push(...tokenIds);
-          lastTokenFetched = tokenIds[tokenIds.length - 1];
-          log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}. Token IDs: ${tokenIds.join(', ')}`, 'DEBUG');
-
-          // Write token data to `contract_tokens` table
-          const tokenData = tokenIds.map(tokenId => [contractAddress, tokenId]);
-          await batchInsertOrUpdate('contract_tokens', ['contract_address', 'token_id'], tokenData, ['contract_address', 'token_id']);
-          log(`Inserted ${tokenData.length} token records for contract ${contractAddress} into contract_tokens`, 'INFO');
-        } else {
+        const tokenIds = response?.data?.data?.tokens || [];
+        if (tokenIds.length === 0) {
           log(`No more tokens found for contract ${contractAddress}`, 'INFO');
           break;
         }
+
+        allTokens.push(...tokenIds);
+        lastTokenFetched = tokenIds[tokenIds.length - 1];
+        log(`Fetched ${tokenIds.length} tokens for contract ${contractAddress}`, 'DEBUG');
+
+        const tokenData = tokenIds.map(tokenId => [contractAddress, tokenId]);
+        await batchInsertOrUpdate('contract_tokens', ['contract_address', 'token_id'], tokenData, ['contract_address', 'token_id']);
       }
 
-      // If tokens were found, update `contracts`, `nft_owners` tables
       if (allTokens.length > 0) {
         await batchInsertOrUpdate('contracts', ['address', 'tokens_minted'], [[contractAddress, allTokens.length]], 'address');
         log(`Updated tokens_minted for contract ${contractAddress} with total tokens: ${allTokens.length}`, 'INFO');
@@ -502,12 +487,12 @@ export async function fetchTokensAndOwners(restAddress) {
         continue;
       }
 
-      batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 0, lastProcessed: contractAddress, lastFetchedToken: lastTokenFetched });
+      batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 0, lastProcessed: contractAddress });
       await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
     }
 
     batchProgressUpdates.push({ step: 'fetchTokensAndOwners', completed: 1 });
-    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed, update.lastFetchedToken));
+    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Finished processing tokens and ownership for all contracts.', 'INFO');
   } catch (error) {
     log(`Error in fetchTokensAndOwners: ${error.message}`, 'ERROR');
