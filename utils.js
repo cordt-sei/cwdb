@@ -180,32 +180,56 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
   }
 
   const placeholders = values[0].map(() => '?').join(', ');
+  const updateConditions = Array.isArray(uniqueColumns)
+    ? uniqueColumns.map((col) => `${col} = ?`).join(' AND ')
+    : `${uniqueColumns} = ?`;
 
-  // Use SQLite's ON CONFLICT DO UPDATE syntax for insert or update in a single step
-  const updateAssignments = columns.map(col => `${col} = excluded.${col}`).join(', ');
-  const sql = `
-    INSERT INTO ${tableName} (${columns.join(', ')}) 
+  const sqlInsert = `
+    INSERT INTO ${tableName} (${columns.join(', ')})
     VALUES (${placeholders})
-    ON CONFLICT (${Array.isArray(uniqueColumns) ? uniqueColumns.join(', ') : uniqueColumns})
-    DO UPDATE SET ${updateAssignments}
+  `;
+  const sqlUpdate = `
+    UPDATE ${tableName}
+    SET ${columns.map((col) => `${col} = ?`).join(', ')}
+    WHERE ${updateConditions}
   `;
 
-  const statement = db.prepare(sql);
+  const insert = db.prepare(sqlInsert);
+  const update = db.prepare(sqlUpdate);
 
-  // Execute all rows in a transaction for better performance
   const transaction = db.transaction((rows) => {
     for (const row of rows) {
       try {
-        // Sanitize each row to properly handle JSON objects or null values
-        const sanitizedRow = row.map((val) => {
+        // Determine the unique values based on uniqueColumns
+        const uniqueValues = Array.isArray(uniqueColumns)
+          ? uniqueColumns.map((col) => row[columns.indexOf(col)])
+          : [row[columns.indexOf(uniqueColumns)]];
+
+        // Safely handle JSON strings, NULL values, and strings
+        const sanitizedRow = row.map((val, idx) => {
           if (typeof val === 'object' && val !== null) {
-            return JSON.stringify(val); // Convert object to JSON string
+            return JSON.stringify(val); // Escape JSON strings
           }
           return val !== null ? val : null;
         });
 
         log(`Processing row: ${sanitizedRow}`, 'DEBUG');
-        statement.run(sanitizedRow);
+
+        // Check if an existing row matches the unique column(s)
+        const existingRow = db
+          .prepare(`SELECT * FROM ${tableName} WHERE ${updateConditions}`)
+          .get(...uniqueValues);
+
+        if (existingRow) {
+          update.run([...sanitizedRow, ...uniqueValues]);
+          log(
+            `Updated row in ${tableName} where ${updateConditions} with values ${JSON.stringify(uniqueValues)}`,
+            'DEBUG'
+          );
+        } else {
+          insert.run(sanitizedRow);
+          log(`Inserted new row into ${tableName}`, 'DEBUG');
+        }
       } catch (error) {
         log(`Failed to insert or update row in ${tableName}: ${error.message}`, 'ERROR');
       }
@@ -217,6 +241,7 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
     log(`Successfully processed ${values.length} rows in ${tableName}`, 'DEBUG');
   } catch (error) {
     log(`Failed to process rows in ${tableName}: ${error.message}`, 'ERROR');
+    throw error; // Re-throw the error to allow higher-level handling
   }
 }
 
