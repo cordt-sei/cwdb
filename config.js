@@ -11,7 +11,7 @@ export const config = {
   pointerApi: "https://pointer.basementnodes.ca",
   timeout: 5000,
   logLevel: 'DEBUG',
-  logToFile: false,
+  logToFile: true,
   retryConfig: {
     retries: 3,
     delay: 1000,

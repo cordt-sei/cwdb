@@ -1,7 +1,7 @@
 // utils.js
-import { axios } from './contractHelper.js';
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { config } from './config.js';
@@ -245,23 +245,35 @@ export function batchInsertOrUpdate(tableName, columns, values, uniqueColumns) {
   }
 }
 
-// General-purpose GET request with retry logic
-export async function fetchData(url, retries = 3) {
+// General-purpose HTTP request with retry logic
+export async function fetchData(url, options = {}) {
+  const { method = 'GET', data = null, headers = {}, retries = 3 } = options;
+
   const response = await retryOperation(async () => {
     try {
-      const res = await axios.get(url, { timeout: config.timeout });
-      log(`Received response for GET request: ${JSON.stringify(res.data)}`, 'DEBUG');
+      const requestConfig = {
+        method,
+        url,
+        timeout: config.timeout,
+        headers,
+        ...(data && { data })
+      };
+
+      const res = await axios(requestConfig);
+      log(`Received response for ${method} request: ${JSON.stringify(res.data)}`, 'DEBUG');
+      
       if (res.status !== 200) {
         log(`Failed to fetch data: ${res.status} - ${res.statusText}`, 'ERROR');
         return null;
       }
       return res.data;
     } catch (error) {
-      log(`Error fetching data from ${url}: ${error.message}`, 'ERROR');
+      log(`Error ${method} data to/from ${url}: ${error.message}`, 'ERROR');
       return null;
     }
   }, retries);
-  return response || {}; // Avoid throwing an error, return an empty object to let main functions handle it
+  
+  return response || {};
 }
 
 export function createWebSocketConnection(url, onMessageCallback, onErrorCallback) {

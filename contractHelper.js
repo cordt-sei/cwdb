@@ -1,7 +1,8 @@
 // contractHelper.js
 
 import { 
-  fetchPaginatedData, 
+  fetchPaginatedData,
+  fetchData,
   sendContractQuery, 
   retryOperation, 
   log,
@@ -236,8 +237,9 @@ export async function fetchContractHistory(restAddress) {
 }
 
 /// Fetch and store metadata for each contract address in concurrent batches
+
 export async function fetchContractMetadata(restAddress) {
-  const batchSize = 50; // Reasonable batch size
+  const batchSize = 50;
   const delayBetweenBatches = 50;
 
   try {
@@ -254,33 +256,92 @@ export async function fetchContractMetadata(restAddress) {
 
     log(`Starting fetchContractMetadata for ${totalContracts} contracts. Resuming from index ${startIndex}.`, 'INFO');
 
+    // Get code_id to contracts mapping for batch updates
+    const codeIdMap = new Map();
+    const contractsByCodeId = db.prepare('SELECT code_id, address FROM contracts').all();
+    contractsByCodeId.forEach(({ code_id, address }) => {
+      if (!codeIdMap.has(code_id)) {
+        codeIdMap.set(code_id, new Set());
+      }
+      codeIdMap.get(code_id).add(address);
+    });
+
     for (let i = startIndex; i < totalContracts; i += batchSize) {
       const batch = contractAddresses.slice(i, i + batchSize);
       const limit = pLimit(config.concurrencyLimit);
 
       const fetchPromises = batch.map(contractAddress => limit(async () => {
         try {
+          // Fetch basic contract info
           const requestUrl = `${restAddress}/cosmwasm/wasm/v1/contract/${contractAddress}`;
           const response = await axios.get(requestUrl);
 
           if (response?.data?.contract_info) {
             const { code_id, creator, admin, label } = response.data.contract_info;
-            return [contractAddress, code_id, creator, admin, label];
+            let contractType = null;
+
+            // Try to determine contract type from label
+            if (label) {
+              const labelLower = label.toLowerCase();
+              if (labelLower.includes('cw721')) contractType = 'cw721_base';
+              else if (labelLower.includes('cw20')) contractType = 'cw20_base';
+              else if (labelLower.includes('cw1155')) contractType = 'cw1155';
+              else if (labelLower.includes('cw404')) contractType = 'cw404';
+            }
+
+            // If no type found from label, try fetching contract info
+            if (!contractType) {
+              try {
+                const infoResponse = await sendContractQuery(restAddress, contractAddress, { contract_info: {} }, false, false);
+                if (infoResponse?.data?.data?.symbol) {
+                  // Most likely a CW20 if it has a symbol
+                  contractType = 'cw20_base';
+                }
+              } catch (error) {
+                // If this fails, we'll determine type in identifyContractTypes function
+                log(`Could not determine type from contract_info for ${contractAddress}`, 'DEBUG');
+              }
+            }
+
+            // If we found a type, update all contracts with the same code_id
+            if (contractType && codeIdMap.has(code_id)) {
+              const relatedContracts = Array.from(codeIdMap.get(code_id));
+              const batchData = relatedContracts.map(addr => [addr, code_id, creator, admin, label, contractType]);
+              await batchInsertOrUpdate(
+                'contracts',
+                ['address', 'code_id', 'creator', 'admin', 'label', 'type'],
+                batchData,
+                'address'
+              );
+              log(`Updated type ${contractType} for all contracts with code_id ${code_id}`, 'DEBUG');
+            } else {
+              // Update single contract without type
+              await batchInsertOrUpdate(
+                'contracts',
+                ['address', 'code_id', 'creator', 'admin', 'label'],
+                [[contractAddress, code_id, creator, admin, label]],
+                'address'
+              );
+            }
+
+            return true;
           }
         } catch (error) {
           log(`Failed to fetch metadata for ${contractAddress}: ${error.message}`, 'ERROR');
         }
-        return null;
+        return false;
       }));
 
-      const results = (await Promise.all(fetchPromises)).filter(Boolean);
+      const results = await Promise.all(fetchPromises);
+      const successCount = results.filter(Boolean).length;
+      log(`Processed ${successCount}/${batch.length} contracts in current batch`, 'INFO');
 
-      if (results.length > 0) {
-        await batchInsertOrUpdate('contracts', ['address', 'code_id', 'creator', 'admin', 'label'], results, 'address');
-        log(`Batch inserted metadata for ${results.length} contracts (${i + results.length} of ${totalContracts})`, 'INFO');
-      }
+      batchProgressUpdates.push({ 
+        step: 'fetchContractMetadata', 
+        completed: 0, 
+        lastProcessed: batch[batch.length - 1] 
+      });
 
-      batchProgressUpdates.push({ step: 'fetchContractMetadata', completed: 0, lastProcessed: batch[batch.length - 1] });
       await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
     }
 
@@ -375,6 +436,7 @@ export async function identifyContractTypes(restAddress) {
 }
 
 // Fetch tokens and their owners for relevant contracts
+
 export async function fetchTokensAndOwners(restAddress) {
   const delayBetweenBatches = 100;
   const concurrencyLimit = config.concurrencyLimit || 5;
@@ -482,6 +544,42 @@ export async function fetchTokensAndOwners(restAddress) {
         const nftOwnerData = allTokens.map(tokenId => [contractAddress, tokenId]);
         await batchInsertOrUpdate('nft_owners', ['collection_address', 'token_id'], nftOwnerData, ['collection_address', 'token_id']);
         log(`Inserted ${nftOwnerData.length} records into nft_owners for contract ${contractAddress}`, 'INFO');
+        // Fetch and update detailed token info
+        const tokenPromises = allTokens.map(tokenId => limit(async () => {
+          try {
+            const nftInfoPayload = { all_nft_info: { token_id: tokenId } };
+            const nftInfoResponse = await sendContractQuery(restAddress, contractAddress, nftInfoPayload, false, false);
+            
+            if (nftInfoResponse?.data?.data) {
+              const { access, info } = nftInfoResponse.data.data;
+              const owner = access?.owner;
+              const tokenUri = info?.token_uri;
+              const metadata = info?.extension;
+
+              // Update token info
+              await batchInsertOrUpdate(
+                'contract_tokens',
+                ['contract_address', 'token_id', 'contract_type', 'token_uri', 'metadata'],
+                [[contractAddress, tokenId, contractType, tokenUri, JSON.stringify(metadata)]],
+                ['contract_address', 'token_id']
+              );
+
+              // Update owner info
+              if (owner) {
+                await batchInsertOrUpdate(
+                  'nft_owners',
+                  ['collection_address', 'token_id', 'owner', 'contract_type'],
+                  [[contractAddress, tokenId, owner, contractType]],
+                  ['collection_address', 'token_id']
+                );
+              }
+            }
+          } catch (error) {
+            log(`Error fetching NFT info for token ${tokenId} in contract ${contractAddress}: ${error.message}`, 'ERROR');
+          }
+        }));
+
+        await Promise.allSettled(tokenPromises);
       } else {
         log(`No tokens retrieved for contract ${contractAddress}. Retrying...`, 'WARN');
         continue;
@@ -559,21 +657,16 @@ export async function fetchPointerData(pointerApi) {
   log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
-// Fetch all evm wallet addresses for owners in nft_owners
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
     log('Starting fetchAssociatedWallets function...', 'INFO');
-
-    const progress = checkProgress('fetchAssociatedWallets');
-    const lastProcessedOwner = progress.last_processed;
 
     const owners = db.prepare(`
       SELECT DISTINCT owner 
       FROM nft_owners
       WHERE owner NOT IN (SELECT wallet_address FROM wallet_associations)
-      AND owner > ?
       ORDER BY owner ASC
-    `).all(lastProcessedOwner || '');
+    `).all();
 
     if (owners.length === 0) {
       log('No unprocessed owners found in nft_owners table.', 'INFO');
@@ -582,49 +675,52 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
 
     log(`Found ${owners.length} unique owners to process`, 'INFO');
 
-    let batchProgressUpdates = [];
+    // Process in batches of 100
+    const batchSize = 100;
+    for (let i = 0; i < owners.length; i += batchSize) {
+      const batch = owners.slice(i, i + batchSize).map(row => row.owner);
+      log(`Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(owners.length / batchSize)}`, 'INFO');
 
-    for (let i = 0; i < owners.length; i += concurrencyLimit) {
-      const batch = owners.slice(i, i + concurrencyLimit);
-      log(`Processing batch ${Math.floor(i / concurrencyLimit) + 1} of ${Math.ceil(owners.length / concurrencyLimit)}`, 'INFO');
+      try {
+        // Note: fetchData expects query params in URL for GET, but this is a POST
+        // So we pass a config object as second parameter
+        const response = await fetchData('https://wallets.sei.basementnodes.ca/query-address', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          data: { addresses: batch }
+        });
 
-      await Promise.all(
-        batch.map(async ({ owner }) => {
-          log(`Fetching EVM address for owner: ${owner}`, 'DEBUG');
-          const payload = {
-            jsonrpc: '2.0',
-            method: 'sei_getEVMAddress',
-            params: [owner],
-            id: 1,
-          };
-
-          try {
-            const response = await sendContractQuery(evmRpcAddress, '', payload, true, false);
-
-            if (response?.data?.result) {
-              await batchInsertOrUpdate('wallet_associations', ['wallet_address', 'evm_address'], [[owner, response.data.result]], 'wallet_address');
-              log(`Stored EVM address for owner: ${owner}`, 'INFO');
-            } else {
-              log(`No EVM address found for owner: ${owner}`, 'WARN');
+        if (Array.isArray(response)) {
+          // Zip owners with their associated addresses
+          const associations = batch.map((owner, index) => {
+            const associated = response[index];
+            if (associated && owner !== associated) {
+              return [owner, associated];
             }
-          } catch (error) {
-            log(`Error processing owner ${owner}: ${error.message}`, 'ERROR');
-          }
-        })
-      );
+            return null;
+          }).filter(Boolean);
 
-      const lastOwnerInBatch = batch[batch.length - 1].owner;
-      batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 0, lastProcessed: lastOwnerInBatch });
-      log(`Updated progress for batch ${Math.floor(i / concurrencyLimit) + 1}`, 'DEBUG');
+          if (associations.length > 0) {
+            await batchInsertOrUpdate(
+              'wallet_associations',
+              ['wallet_address', 'evm_address'],
+              associations,
+              'wallet_address'
+            );
+            log(`Stored ${associations.length} wallet associations from batch of ${batch.length}`, 'INFO');
+          }
+        }
+      } catch (error) {
+        log(`Error processing batch: ${error.message}`, 'ERROR');
+        continue;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 1 });
-    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Finished processing all associated wallets.', 'INFO');
   } catch (error) {
     log(`Critical error in fetchAssociatedWallets: ${error.message}`, 'ERROR');
     throw error;
   }
 }
-
-export { axios };

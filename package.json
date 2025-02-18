@@ -10,7 +10,7 @@
     "lint": "eslint '**/*.js'",
     "lint:fix": "eslint '**/*.js' --fix",
     "test": "jest --verbose --coverage",
-    "test-indexer": "node test_index.js",
+    "test-indexer": "rm -f ./data/*.db ./logs/*.log; node test_index.js",
     "dev": "nodemon index.js"
   },
   "keywords": [
