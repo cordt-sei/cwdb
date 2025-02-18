@@ -1,7 +1,8 @@
 // contractHelper.js
 
 import { 
-  fetchPaginatedData, 
+  fetchPaginatedData,
+  fetchData,
   sendContractQuery, 
   retryOperation, 
   log,
@@ -656,21 +657,16 @@ export async function fetchPointerData(pointerApi) {
   log('Finished fetching pointer data for all addresses.', 'INFO');
 }
 
-// Fetch all evm wallet addresses for owners in nft_owners
 export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5) {
   try {
     log('Starting fetchAssociatedWallets function...', 'INFO');
-
-    const progress = checkProgress('fetchAssociatedWallets');
-    const lastProcessedOwner = progress.last_processed;
 
     const owners = db.prepare(`
       SELECT DISTINCT owner 
       FROM nft_owners
       WHERE owner NOT IN (SELECT wallet_address FROM wallet_associations)
-      AND owner > ?
       ORDER BY owner ASC
-    `).all(lastProcessedOwner || '');
+    `).all();
 
     if (owners.length === 0) {
       log('No unprocessed owners found in nft_owners table.', 'INFO');
@@ -679,49 +675,52 @@ export async function fetchAssociatedWallets(evmRpcAddress, concurrencyLimit = 5
 
     log(`Found ${owners.length} unique owners to process`, 'INFO');
 
-    let batchProgressUpdates = [];
+    // Process in batches of 100
+    const batchSize = 100;
+    for (let i = 0; i < owners.length; i += batchSize) {
+      const batch = owners.slice(i, i + batchSize).map(row => row.owner);
+      log(`Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(owners.length / batchSize)}`, 'INFO');
 
-    for (let i = 0; i < owners.length; i += concurrencyLimit) {
-      const batch = owners.slice(i, i + concurrencyLimit);
-      log(`Processing batch ${Math.floor(i / concurrencyLimit) + 1} of ${Math.ceil(owners.length / concurrencyLimit)}`, 'INFO');
+      try {
+        // Note: fetchData expects query params in URL for GET, but this is a POST
+        // So we pass a config object as second parameter
+        const response = await fetchData('https://wallets.sei.basementnodes.ca/query-address', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          data: { addresses: batch }
+        });
 
-      await Promise.all(
-        batch.map(async ({ owner }) => {
-          log(`Fetching EVM address for owner: ${owner}`, 'DEBUG');
-          const payload = {
-            jsonrpc: '2.0',
-            method: 'sei_getEVMAddress',
-            params: [owner],
-            id: 1,
-          };
-
-          try {
-            const response = await sendContractQuery(evmRpcAddress, '', payload, true, false);
-
-            if (response?.data?.result) {
-              await batchInsertOrUpdate('wallet_associations', ['wallet_address', 'evm_address'], [[owner, response.data.result]], 'wallet_address');
-              log(`Stored EVM address for owner: ${owner}`, 'INFO');
-            } else {
-              log(`No EVM address found for owner: ${owner}`, 'WARN');
+        if (Array.isArray(response)) {
+          // Zip owners with their associated addresses
+          const associations = batch.map((owner, index) => {
+            const associated = response[index];
+            if (associated && owner !== associated) {
+              return [owner, associated];
             }
-          } catch (error) {
-            log(`Error processing owner ${owner}: ${error.message}`, 'ERROR');
-          }
-        })
-      );
+            return null;
+          }).filter(Boolean);
 
-      const lastOwnerInBatch = batch[batch.length - 1].owner;
-      batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 0, lastProcessed: lastOwnerInBatch });
-      log(`Updated progress for batch ${Math.floor(i / concurrencyLimit) + 1}`, 'DEBUG');
+          if (associations.length > 0) {
+            await batchInsertOrUpdate(
+              'wallet_associations',
+              ['wallet_address', 'evm_address'],
+              associations,
+              'wallet_address'
+            );
+            log(`Stored ${associations.length} wallet associations from batch of ${batch.length}`, 'INFO');
+          }
+        }
+      } catch (error) {
+        log(`Error processing batch: ${error.message}`, 'ERROR');
+        continue;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    batchProgressUpdates.push({ step: 'fetchAssociatedWallets', completed: 1 });
-    batchProgressUpdates.forEach(update => updateProgress(update.step, update.completed, update.lastProcessed));
     log('Finished processing all associated wallets.', 'INFO');
   } catch (error) {
     log(`Critical error in fetchAssociatedWallets: ${error.message}`, 'ERROR');
     throw error;
   }
 }
-
-export { axios };

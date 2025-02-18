@@ -1,110 +1,28 @@
 // index.js
 
 import { 
-  fetchCodeIds, 
+  fetchCodeIds,
   fetchContractAddressesByCodeId,
   fetchContractMetadata,
-  fetchContractHistory, 
-  identifyContractTypes, 
-  fetchTokensAndOwners, 
-  fetchPointerData, 
+  fetchContractHistory,
+  identifyContractTypes,
+  fetchTokensAndOwners,
+  fetchPointerData,
   fetchAssociatedWallets 
 } from './contractHelper.js';
 import { 
-  createWebSocketConnection, 
-  log, 
-  checkProgress, 
-  updateProgress,
-  db
+  createWebSocketConnection,
+  log,
+  checkProgress,
+  updateProgress
 } from './utils.js';
 import { config } from './config.js';
+import { initializeDatabase } from './initDb.js';
 import fs from 'fs';
-import pLimit from 'p-limit';
 
 // Ensure data and logs directories exist
 if (!fs.existsSync('./data')) fs.mkdirSync('./data');
 if (!fs.existsSync('./logs')) fs.mkdirSync('./logs');
-
-function initializeDatabase() {
-  const createTableStatements = [
-    `CREATE TABLE IF NOT EXISTS indexer_progress (
-      step TEXT PRIMARY KEY,
-      completed INTEGER DEFAULT 0,
-      last_processed TEXT,
-      last_fetched_token TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS code_ids (
-      code_id TEXT PRIMARY KEY,
-      creator TEXT,
-      instantiate_permission TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS contracts (
-      code_id TEXT,
-      address TEXT PRIMARY KEY,
-      type TEXT,
-      creator TEXT,
-      admin TEXT,
-      label TEXT,
-      tokens_minted TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS contract_history (
-      contract_address TEXT,
-      operation TEXT,
-      code_id TEXT,
-      updated TEXT,
-      msg TEXT,
-      PRIMARY KEY (contract_address, operation, code_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS contract_tokens (
-      contract_address TEXT,
-      token_id TEXT,
-      contract_type TEXT,
-      token_uri TEXT,
-      metadata TEXT,
-      PRIMARY KEY (contract_address, token_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS cw20_owners (
-      contract_address TEXT,
-      owner_address TEXT,
-      balance TEXT,
-      PRIMARY KEY (contract_address, owner_address)
-    )`,
-    `CREATE TABLE IF NOT EXISTS nft_owners (
-      collection_address TEXT,
-      token_id TEXT,
-      owner TEXT,
-      contract_type TEXT,
-      PRIMARY KEY (collection_address, token_id, owner)
-    )`,
-    `CREATE TABLE IF NOT EXISTS pointer_data (
-      contract_address TEXT PRIMARY KEY,
-      pointer_address TEXT,
-      pointee_address TEXT,
-      is_base_asset INTEGER,
-      is_pointer INTEGER,
-      pointer_type TEXT
-    )`,
-    `CREATE TABLE IF NOT EXISTS wallet_associations (
-      wallet_address TEXT PRIMARY KEY,
-      evm_address TEXT
-    )`
-  ];
-
-  try {
-    const dbInstance = db; // Using better-sqlite3 instance directly
-    dbInstance.transaction(() => {
-      for (const statement of createTableStatements) {
-        dbInstance.prepare(statement).run();
-        log(`Table created/verified: ${statement}`, 'INFO');
-      }
-    })();
-
-    log('All tables initialized successfully, with contract_tokens schema validated.', 'INFO');
-  } catch (error) {
-    log(`Failed during table initialization: ${error.message}`, 'ERROR');
-    throw error;
-  }
-}
 
 // Main function to run the indexer
 async function runIndexer() {
@@ -146,7 +64,7 @@ async function runIndexer() {
             completed = true;
             log(`Completed step: ${step.name}`, 'INFO');
 
-            // Perform batch updates after every 5 steps to avoid excessive writes
+            // batch update every 5 steps
             if (batchProgressUpdates.length >= 5) {
               batchProgressUpdates.forEach(({ step, completed }) => {
                 updateProgress(step, completed);
